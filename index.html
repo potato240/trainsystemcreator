@@ -1103,6 +1103,28 @@
     ctx.stroke();
   }
 
+  // Passengers riding a train are invisible as separate dots (they boarded),
+  // but still need to visibly read as "on the train" - draw them as small
+  // dots at window positions along its cars, following its live curved pose.
+  function drawRidingPassengers(tr) {
+    const aboard = passengers.filter(p => p.state === 'riding' && p.trainId === tr.id);
+    if (aboard.length === 0) return;
+    const sampler = makeRouteSampler(tr);
+    aboard.forEach((p, i) => {
+      const car = i % TRAIN_CARS;
+      const carCenterOffset = -TRAIN_LENGTH / 2 + car * CAR_LENGTH + CAR_LENGTH / 2;
+      const along = ((Math.floor(i / TRAIN_CARS) % 3) - 1) * (CAR_LENGTH * 0.28);
+      const pose = sampler(carCenterOffset + along);
+      ctx.beginPath();
+      ctx.arc(pose.x, pose.y, 2.6, 0, Math.PI * 2);
+      ctx.fillStyle = p.color;
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+      ctx.lineWidth = 0.8;
+      ctx.stroke();
+    });
+  }
+
   function drawPendingRoute() {
     if (!pendingRoute || pendingRoute.path.length < 1) return;
     ctx.strokeStyle = '#5cb3e8';
@@ -1156,6 +1178,7 @@
     }
     for (const tr of trains) {
       drawArticulatedTrain(makeRouteSampler(tr));
+      drawRidingPassengers(tr);
     }
     for (const p of passengers) {
       drawPassenger(p);
