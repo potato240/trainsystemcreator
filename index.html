@@ -215,6 +215,8 @@
   const PASSENGER_SPAWN_SECONDS = 4;
   const PASSENGER_COLORS = ['#e8734d', '#5cb3e8', '#8bd17c', '#e8c93d', '#c78be8', '#f2946b'];
   const GRID_SIZE = 40; // roads snap to this grid and may only run in the 8 grid directions
+  const CROSSING_SNAP_DIST = GRID_SIZE / 2; // roads this close to a rail node snap onto it exactly
+  const CROSSING_TRIGGER_DIST = 60; // px - a train this close to a crossing lowers its barriers
 
   function resize() {
     canvas.width = window.innerWidth * devicePixelRatio;
@@ -333,20 +335,44 @@
     return { x: Math.round(x / GRID_SIZE) * GRID_SIZE, y: Math.round(y / GRID_SIZE) * GRID_SIZE };
   }
 
+  // Angle-tolerant so a road snapped exactly onto a rail node (which isn't
+  // necessarily grid-aligned) still validates - plain grid points satisfy
+  // this exactly anyway since their offsets are always multiples of 45deg.
   function isGridDirection(a, b) {
     const dx = b.x - a.x, dy = b.y - a.y;
     if (dx === 0 && dy === 0) return false;
-    return dx === 0 || dy === 0 || Math.abs(dx) === Math.abs(dy);
+    const deg = Math.atan2(dy, dx) * 180 / Math.PI;
+    const mod = ((deg % 45) + 45) % 45;
+    const tolerance = 6;
+    return mod < tolerance || mod > 45 - tolerance;
+  }
+
+  // Places a road point at an exact position (no grid-snap) - used when the
+  // click lands close enough to an existing rail node that the road should
+  // meet it exactly, so a crossing there lines up with the road precisely.
+  function addRoadNodeAt(x, y) {
+    const existing = roadNodes.find(n => n.x === x && n.y === y);
+    if (existing) return existing;
+    const n = { id: uid(), x, y };
+    roadNodes.push(n);
+    save();
+    return n;
   }
 
   function addRoadNode(x, y) {
     const p = snapToGrid(x, y);
-    const existing = roadNodes.find(n => n.x === p.x && n.y === p.y);
-    if (existing) return existing;
-    const n = { id: uid(), x: p.x, y: p.y };
-    roadNodes.push(n);
-    save();
-    return n;
+    return addRoadNodeAt(p.x, p.y);
+  }
+
+  // A rail node within CROSSING_SNAP_DIST of a grid-snapped click, if any -
+  // roads snap onto it exactly instead of the grid point.
+  function nearbyRailNode(x, y) {
+    let best = null, bestDist = CROSSING_SNAP_DIST;
+    for (const n of nodes) {
+      const d = Math.hypot(n.x - x, n.y - y);
+      if (d < bestDist) { bestDist = d; best = n; }
+    }
+    return best;
   }
 
   function addRoadSegment(aId, bId) {
@@ -768,7 +794,8 @@
 
   // A level crossing's default angle runs perpendicular to whichever way the
   // track passes through its rail node - a reasonable starting guess for
-  // where the road crosses it, since crossingAngle is user-adjustable after.
+  // where the road crosses it when there's no road there yet. Once a road is
+  // actually drawn through the node, crossingAngle is set to match it exactly.
   function defaultCrossingAngle(node) {
     const neigh = nodeNeighbors(node.id);
     let angle = 0;
@@ -779,10 +806,11 @@
     return angle + Math.PI / 2;
   }
 
-  const CROSSING_BAR_LEN = 26;
+  const CROSSING_PATCH_LEN = 16; // along the road
+  const CROSSING_ROAD_HALF_WIDTH = 11; // across the road, matches road paving width
 
   function crossingHandlePos(node) {
-    const r = CROSSING_BAR_LEN + 20;
+    const r = CROSSING_PATCH_LEN + 26;
     return { x: node.x + Math.cos(node.crossingAngle) * r, y: node.y + Math.sin(node.crossingAngle) * r };
   }
 
@@ -794,11 +822,15 @@
     return Math.hypot(h.x - x, h.y - y) <= 8 ? n.id : null;
   }
 
-  // A level crossing is a rail node flagged .crossing - render red/white
-  // hazard stripes across the track there at its own adjustable angle, plus
-  // short barrier arms on each side.
+  // A level crossing is a rail node flagged .crossing: crossingAngle is the
+  // road's own direction through it (local +X after rotating), so the
+  // striped patch sits square with the road, and .barrier (0=open..1=closed,
+  // eased toward a train-triggered target in the animation loop) swings a
+  // pair of gates from tucked alongside the road out to blocking it.
   function drawCrossing(node, isSelected) {
-    const barLen = CROSSING_BAR_LEN;
+    const patchLen = CROSSING_PATCH_LEN;
+    const half = CROSSING_ROAD_HALF_WIDTH;
+    const barrier = node.barrier || 0;
 
     ctx.save();
     ctx.translate(node.x, node.y);
@@ -807,29 +839,38 @@
     // road surface patch with diagonal hazard stripes
     ctx.save();
     ctx.beginPath();
-    ctx.rect(-11, -barLen, 22, barLen * 2);
+    ctx.rect(-patchLen, -half, patchLen * 2, half * 2);
     ctx.clip();
     ctx.fillStyle = '#403f3d';
-    ctx.fillRect(-11, -barLen, 22, barLen * 2);
+    ctx.fillRect(-patchLen, -half, patchLen * 2, half * 2);
     ctx.strokeStyle = '#e8c93d';
-    ctx.lineWidth = 6;
-    for (let s = -barLen * 2; s < 22; s += 12) {
+    ctx.lineWidth = 5;
+    for (let s = -half * 4; s < patchLen * 2; s += 10) {
       ctx.beginPath();
-      ctx.moveTo(s, -barLen);
-      ctx.lineTo(s + barLen * 2, barLen);
+      ctx.moveTo(-patchLen + s, -half);
+      ctx.lineTo(-patchLen + s + half * 2, half);
       ctx.stroke();
     }
     ctx.restore();
 
-    // striped barrier arms, angled up on each side
+    // striped gates pivoting at the road edge on each side of the track,
+    // swinging from tucked alongside the road (open) to across it (closed)
+    const armLen = half * 2;
     for (const side of [-1, 1]) {
+      const openAngle = side > 0 ? 0 : Math.PI;
+      const closedAngle = Math.PI / 2;
+      const armAngle = openAngle + (closedAngle - openAngle) * barrier;
       ctx.save();
-      ctx.translate(0, side * (barLen + 4));
-      ctx.rotate(side * -0.35);
-      for (let i = 0; i < 4; i++) {
+      ctx.translate(side * (patchLen + 6), -half);
+      ctx.rotate(armAngle);
+      for (let i = 0; i < 3; i++) {
         ctx.fillStyle = i % 2 === 0 ? '#e8c93d' : '#c0392b';
-        ctx.fillRect(-3, side > 0 ? -18 - i * 9 : i * 9, 6, 9);
+        ctx.fillRect(i * (armLen / 3), -2.5, armLen / 3 + 0.5, 5);
       }
+      ctx.fillStyle = '#2a2a2a';
+      ctx.beginPath();
+      ctx.arc(0, 0, 2.5, 0, Math.PI * 2);
+      ctx.fill();
       ctx.restore();
     }
     ctx.restore();
@@ -1233,13 +1274,15 @@
       const start = getRoadNode(lastRoadNodeId);
       if (start) {
         const snapped = snapToGrid(mouse.x, mouse.y);
+        const rail = nearbyRailNode(snapped.x, snapped.y);
+        const target = rail || snapped;
         ctx.globalAlpha = 0.5;
-        ctx.strokeStyle = isGridDirection(start, snapped) ? '#e8d98a' : '#e8734d';
+        ctx.strokeStyle = isGridDirection(start, target) ? '#e8d98a' : '#e8734d';
         ctx.lineWidth = 6;
         ctx.setLineDash([6, 6]);
         ctx.beginPath();
         ctx.moveTo(start.x, start.y);
-        ctx.lineTo(snapped.x, snapped.y);
+        ctx.lineTo(target.x, target.y);
         ctx.stroke();
         ctx.setLineDash([]);
         ctx.globalAlpha = 1;
@@ -1387,16 +1430,31 @@
 
     if (mode === 'road') {
       const snapped = snapToGrid(p.x, p.y);
-      const node = addRoadNode(snapped.x, snapped.y);
+      const rail = nearbyRailNode(snapped.x, snapped.y);
+      const node = rail ? addRoadNodeAt(rail.x, rail.y) : addRoadNode(snapped.x, snapped.y);
+
       if (lastRoadNodeId != null && lastRoadNodeId !== node.id) {
         const start = getRoadNode(lastRoadNodeId);
         if (isGridDirection(start, node)) {
           addRoadSegment(lastRoadNodeId, node.id);
+          if (rail) {
+            rail.crossing = true;
+            rail.crossingAngle = Math.atan2(node.y - start.y, node.x - start.x);
+            if (rail.barrier == null) rail.barrier = 0;
+          }
         } else {
           hint.textContent = 'That point isn\'t on one of the 8 grid directions from the last one - starting a new road there instead.';
         }
+      } else if (rail) {
+        // starting a fresh chain exactly on a rail node - flag the crossing now,
+        // its angle gets refined once a road segment actually runs through it
+        rail.crossing = true;
+        if (rail.crossingAngle == null) rail.crossingAngle = defaultCrossingAngle(rail);
+        if (rail.barrier == null) rail.barrier = 0;
       }
+
       lastRoadNodeId = node.id;
+      save();
       draw();
       return;
     }
@@ -1679,11 +1737,28 @@
     }
   }
 
+  // Lowers a crossing's barriers when any train is within CROSSING_TRIGGER_DIST
+  // of it, easing the animated .barrier value toward 0 (open) or 1 (closed).
+  function tickCrossings(dt) {
+    for (const n of nodes) {
+      if (!n.crossing) continue;
+      let active = false;
+      for (const tr of trains) {
+        const pose = trainPoseAt(tr, tr.pos);
+        if (Math.hypot(pose.x - n.x, pose.y - n.y) < CROSSING_TRIGGER_DIST) { active = true; break; }
+      }
+      const target = active ? 1 : 0;
+      const current = n.barrier || 0;
+      n.barrier = current + (target - current) * Math.min(1, dt * 4);
+    }
+  }
+
   function animate(ts) {
     if (lastTick != null) {
       const dt = Math.min(0.05, (ts - lastTick) / 1000);
 
       for (const tr of trains) tickTrain(tr, dt);
+      tickCrossings(dt);
 
       passengerSpawnTimer += dt;
       if (passengerSpawnTimer >= PASSENGER_SPAWN_SECONDS) {
