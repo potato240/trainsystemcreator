@@ -216,7 +216,7 @@
   const PASSENGER_COLORS = ['#e8734d', '#5cb3e8', '#8bd17c', '#e8c93d', '#c78be8', '#f2946b'];
   const GRID_SIZE = 40; // roads snap to this grid and may only run in the 8 grid directions
   const CROSSING_SNAP_DIST = GRID_SIZE / 2; // roads this close to a rail node snap onto it exactly
-  const CROSSING_TRIGGER_DIST = 60; // px - a train this close to a crossing lowers its barriers
+  const CROSSING_TRIGGER_DIST = 180; // px - a train this close to a crossing lowers its barriers
 
   function resize() {
     canvas.width = window.innerWidth * devicePixelRatio;
