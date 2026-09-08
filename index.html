@@ -415,13 +415,29 @@
     });
   }
 
+  // Cars near either end of the train can sit at a distance outside [0,
+  // total] once the train itself is close to an end of its route - extend
+  // straight out along that end's tangent instead of clamping them all onto
+  // the same endpoint, which used to collapse the whole train into one spot.
   function trainPoseAt(train, distAlong) {
     const { pts, cum, total } = train;
-    const d = Math.max(0, Math.min(total, distAlong));
+
+    if (distAlong < 0) {
+      const p0 = pts[0], p1 = pts[1];
+      const angle = Math.atan2(p1.y - p0.y, p1.x - p0.x);
+      return { x: p0.x + Math.cos(angle) * distAlong, y: p0.y + Math.sin(angle) * distAlong, angle };
+    }
+    if (distAlong > total) {
+      const pn = pts[pts.length - 1], pn1 = pts[pts.length - 2];
+      const angle = Math.atan2(pn.y - pn1.y, pn.x - pn1.x);
+      const extra = distAlong - total;
+      return { x: pn.x + Math.cos(angle) * extra, y: pn.y + Math.sin(angle) * extra, angle };
+    }
+
     let i = 1;
-    while (i < cum.length - 1 && cum[i] < d) i++;
+    while (i < cum.length - 1 && cum[i] < distAlong) i++;
     const segLen = cum[i] - cum[i - 1] || 1;
-    const t = (d - cum[i - 1]) / segLen;
+    const t = (distAlong - cum[i - 1]) / segLen;
     const p0 = pts[i - 1], p1 = pts[i];
     return {
       x: p0.x + (p1.x - p0.x) * t,
