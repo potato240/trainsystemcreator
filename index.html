@@ -381,9 +381,27 @@
 
   // Intermediate path nodes (not the route's start/end, which already get an
   // end-of-line dwell) that sit at a station stop there so passengers can board.
+  // A station's platform spans its whole connecting track (nodeId to
+  // farNodeId, exactly TRAIN_LENGTH long). When the route traverses that
+  // full segment, stop once at its midpoint so the train lands centered on
+  // the platform - not once at each end, which would leave only half the
+  // train inside it each time.
   function computeStationStops(path, waypointDist) {
     const stops = [];
+    const covered = new Set();
+    for (const f of facilities) {
+      if (f.kind !== 'station') continue;
+      for (let i = 0; i < path.length - 1; i++) {
+        const a = path[i], b = path[i + 1];
+        if ((a === f.nodeId && b === f.farNodeId) || (a === f.farNodeId && b === f.nodeId)) {
+          stops.push({ dist: (waypointDist[i] + waypointDist[i + 1]) / 2, nodeId: a });
+          covered.add(i);
+          covered.add(i + 1);
+        }
+      }
+    }
     for (let i = 1; i < path.length - 1; i++) {
+      if (covered.has(i)) continue;
       const nodeId = path[i];
       const atStation = facilities.some(f => f.kind === 'station' && (f.nodeId === nodeId || f.farNodeId === nodeId));
       if (atStation) stops.push({ dist: waypointDist[i], nodeId });
