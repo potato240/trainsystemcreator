@@ -163,6 +163,7 @@
   // Separation between the two lanes of a double track.
   const DOUBLE_GAP = 22;
   const TRAIN_SPEED = 70; // px/s
+  const STOP_SECONDS = 3; // dwell time at a station stop or an end-of-line reversal
 
   function resize() {
     canvas.width = window.innerWidth * devicePixelRatio;
@@ -356,6 +357,7 @@
 
   function buildRouteGeometry(path) {
     let pts = [];
+    const waypointIdx = [0]; // index into pts for each path[] node
     for (let i = 0; i < path.length - 1; i++) {
       const track = trackBetween(path[i], path[i + 1]);
       if (!track) return null;
@@ -366,19 +368,38 @@
       }
       if (pts.length > 0) segPts = segPts.slice(1);
       pts = pts.concat(segPts);
+      waypointIdx.push(pts.length - 1);
     }
     if (pts.length < 2) return null;
     const cum = [0];
     for (let i = 1; i < pts.length; i++) {
       cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
     }
-    return { pts, cum, total: cum[cum.length - 1] };
+    const waypointDist = waypointIdx.map(idx => cum[idx]);
+    return { pts, cum, total: cum[cum.length - 1], waypointDist };
+  }
+
+  // Intermediate path nodes (not the route's start/end, which already get an
+  // end-of-line dwell) that sit at a station stop there so passengers can board.
+  function computeStationStops(path, waypointDist) {
+    const stops = [];
+    for (let i = 1; i < path.length - 1; i++) {
+      const nodeId = path[i];
+      const atStation = facilities.some(f => f.kind === 'station' && (f.nodeId === nodeId || f.farNodeId === nodeId));
+      if (atStation) stops.push({ dist: waypointDist[i], nodeId });
+    }
+    return stops;
   }
 
   function spawnTrain(depotId, path) {
     const geo = buildRouteGeometry(path);
     if (!geo) return null;
-    const train = { id: uid(), depotId, path, pts: geo.pts, cum: geo.cum, total: geo.total, pos: 0, dir: 1, speed: TRAIN_SPEED };
+    const train = {
+      id: uid(), depotId, path, pts: geo.pts, cum: geo.cum, total: geo.total,
+      pos: 0, dir: 1, speed: TRAIN_SPEED,
+      state: 'running', waitTimer: 0, pendingDir: null, lastStopDist: null,
+      stationStops: computeStationStops(path, geo.waypointDist),
+    };
     trains.push(train);
     save();
     return train;
@@ -701,14 +722,6 @@
   // independently along a `sampler(offset)` function that returns {x,y,angle}
   // for a signed distance from the train's own center - so on a curved route
   // each car bends to follow the track instead of the whole unit staying rigid.
-  function makeStraightSampler(p) {
-    return (offset) => ({
-      x: p.x + Math.cos(p.angle) * offset,
-      y: p.y + Math.sin(p.angle) * offset,
-      angle: p.angle,
-    });
-  }
-
   function makeRouteSampler(train) {
     return (offset) => trainPoseAt(train, train.pos + offset);
   }
@@ -801,18 +814,6 @@
     }
   }
 
-  function drawFacilityTrains(f) {
-    const sides = f.double ? [1, -1] : [1];
-    for (const side of sides) {
-      const laneOffset = f.double ? side * DOUBLE_GAP / 2 : 0;
-      drawArticulatedTrain(makeStraightSampler({
-        x: f.x - Math.sin(f.angle) * laneOffset,
-        y: f.y + Math.cos(f.angle) * laneOffset,
-        angle: f.angle,
-      }));
-    }
-  }
-
   function drawNode(node, isSelected, isPending) {
     const r = node.double ? 11 : 9;
 
@@ -882,7 +883,6 @@
     for (const f of facilities) {
       const isSelected = selected && selected.type === 'facility' && selected.id === f.id;
       drawFacility(f, isSelected);
-      drawFacilityTrains(f);
     }
     for (const n of nodes) {
       const isSelected = selected && selected.type === 'node' && selected.id === n.id;
@@ -1134,15 +1134,62 @@
 
   // ---- train animation loop ----
   let lastTick = null;
+  function tickTrain(tr, dt) {
+    if (tr.state === 'waiting') {
+      tr.waitTimer -= dt;
+      if (tr.waitTimer <= 0) {
+        tr.state = 'running';
+        if (tr.pendingDir != null) { tr.dir = tr.pendingDir; tr.pendingDir = null; }
+      }
+      return;
+    }
+
+    const prevPos = tr.pos;
+    const nextPos = tr.pos + tr.speed * tr.dir * dt;
+
+    // stop and dwell at any station stop crossed on this step (except the
+    // one just departed from, so it doesn't re-trigger the instant it moves)
+    let stopHit = null;
+    for (const st of tr.stationStops) {
+      if (st.dist === tr.lastStopDist) continue;
+      const crossed = tr.dir > 0
+        ? (prevPos < st.dist && nextPos >= st.dist)
+        : (prevPos > st.dist && nextPos <= st.dist);
+      if (crossed) { stopHit = st; break; }
+    }
+
+    if (stopHit) {
+      tr.pos = stopHit.dist;
+      tr.state = 'waiting';
+      tr.waitTimer = STOP_SECONDS;
+      tr.pendingDir = tr.dir; // same direction after a station dwell
+      tr.lastStopDist = stopHit.dist;
+      return;
+    }
+
+    if (nextPos >= tr.total) {
+      tr.pos = tr.total;
+      tr.state = 'waiting';
+      tr.waitTimer = STOP_SECONDS;
+      tr.pendingDir = -1;
+      tr.lastStopDist = null;
+    } else if (nextPos <= 0) {
+      tr.pos = 0;
+      tr.state = 'waiting';
+      tr.waitTimer = STOP_SECONDS;
+      tr.pendingDir = 1;
+      tr.lastStopDist = null;
+    } else {
+      tr.pos = nextPos;
+      if (tr.lastStopDist != null && Math.abs(tr.pos - tr.lastStopDist) > 4) tr.lastStopDist = null;
+    }
+  }
+
   function animate(ts) {
     if (lastTick != null) {
       const dt = Math.min(0.05, (ts - lastTick) / 1000);
       if (trains.length > 0) {
-        for (const tr of trains) {
-          tr.pos += tr.speed * tr.dir * dt;
-          if (tr.pos >= tr.total) { tr.pos = tr.total; tr.dir = -1; }
-          else if (tr.pos <= 0) { tr.pos = 0; tr.dir = 1; }
-        }
+        for (const tr of trains) tickTrain(tr, dt);
         draw();
       }
     }
