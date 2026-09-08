@@ -174,7 +174,7 @@
     <button class="tool danger" id="clearBtn">Clear All</button>
   </div>
 
-  <div id="stats">Nodes: <span id="nodeCount">0</span><br>Tracks: <span id="trackCount">0</span><br>Facilities: <span id="facilityCount">0</span><br>Trains: <span id="trainCount">0</span></div>
+  <div id="stats">Nodes: <span id="nodeCount">0</span><br>Tracks: <span id="trackCount">0</span><br>Facilities: <span id="facilityCount">0</span><br>Trains: <span id="trainCount">0</span><br>Passengers: <span id="passengerCount">0</span></div>
 
   <div id="hint">Click empty ground to place a rail node.</div>
 
@@ -187,6 +187,7 @@
   const trackCountEl = document.getElementById('trackCount');
   const facilityCountEl = document.getElementById('facilityCount');
   const trainCountEl = document.getElementById('trainCount');
+  const passengerCountEl = document.getElementById('passengerCount');
   const STORAGE_KEY = 'tsc_track_state_v2';
 
   // Reference rolling stock: a 4-car Southeastern Class 375 "Electrostar" EMU.
@@ -206,6 +207,10 @@
   const DOUBLE_GAP = 22;
   const TRAIN_SPEED = 70; // px/s
   const STOP_SECONDS = 3; // dwell time at a station stop or an end-of-line reversal
+  const WALK_SPEED = 40; // px/s
+  const WALK_DISTANCE = 260; // px - stations this close are walkable directly
+  const PASSENGER_SPAWN_SECONDS = 4;
+  const PASSENGER_COLORS = ['#e8734d', '#5cb3e8', '#8bd17c', '#e8c93d', '#c78be8', '#f2946b'];
 
   function resize() {
     canvas.width = window.innerWidth * devicePixelRatio;
@@ -222,6 +227,8 @@
   let tracks = [];      // {id, aId, bId, c1off, c2off, c1locked, c2locked, double}
   let facilities = [];  // {id, kind:'station'|'depot', x, y, angle, nodeId, farNodeId, trackId, double}
   let trains = [];      // {id, depotId, path:[nodeId...], pts, cum, total, pos, dir, speed}
+  let passengers = [];  // {id, originId, destId, atStationId, state, x, y, color, trainId, walk}
+  let passengerSpawnTimer = 0;
   let nextId = 1;
 
   let mode = 'node';
@@ -438,7 +445,7 @@
       for (let i = 0; i < path.length - 1; i++) {
         const a = path[i], b = path[i + 1];
         if ((a === f.nodeId && b === f.farNodeId) || (a === f.farNodeId && b === f.nodeId)) {
-          stops.push({ dist: (waypointDist[i] + waypointDist[i + 1]) / 2, nodeId: a });
+          stops.push({ dist: (waypointDist[i] + waypointDist[i + 1]) / 2, nodeId: a, facilityId: f.id });
           covered.add(i);
           covered.add(i + 1);
         }
@@ -447,10 +454,17 @@
     for (let i = 1; i < path.length - 1; i++) {
       if (covered.has(i)) continue;
       const nodeId = path[i];
-      const atStation = facilities.some(f => f.kind === 'station' && (f.nodeId === nodeId || f.farNodeId === nodeId));
-      if (atStation) stops.push({ dist: waypointDist[i], nodeId });
+      const f = facilities.find(f => f.kind === 'station' && (f.nodeId === nodeId || f.farNodeId === nodeId));
+      if (f) stops.push({ dist: waypointDist[i], nodeId, facilityId: f.id });
     }
     return stops;
+  }
+
+  // If a route's start/end node happens to sit at a station, treat the
+  // end-of-line dwell there as a station arrival too (for boarding/alighting).
+  function stationAtNode(nodeId) {
+    const f = facilities.find(f => f.kind === 'station' && (f.nodeId === nodeId || f.farNodeId === nodeId));
+    return f ? f.id : null;
   }
 
   function spawnTrain(depotId, path) {
@@ -461,6 +475,8 @@
       pos: 0, dir: 1, speed: TRAIN_SPEED,
       state: 'running', waitTimer: 0, pendingDir: null, lastStopDist: null,
       stationStops: computeStationStops(path, geo.waypointDist),
+      startFacilityId: stationAtNode(path[0]),
+      endFacilityId: stationAtNode(path[path.length - 1]),
     };
     trains.push(train);
     save();
@@ -923,6 +939,17 @@
     }
   }
 
+  function drawPassenger(p) {
+    if (p.state === 'riding' || p.state === 'arrived') return;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = p.color;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
   function drawPendingRoute() {
     if (!pendingRoute || pendingRoute.path.length < 1) return;
     ctx.strokeStyle = '#5cb3e8';
@@ -970,6 +997,9 @@
     for (const tr of trains) {
       drawArticulatedTrain(makeRouteSampler(tr));
     }
+    for (const p of passengers) {
+      drawPassenger(p);
+    }
 
     drawPendingRoute();
 
@@ -983,6 +1013,7 @@
     trackCountEl.textContent = tracks.length;
     facilityCountEl.textContent = facilities.length;
     trainCountEl.textContent = trains.length;
+    passengerCountEl.textContent = passengers.length;
   }
 
   // ---- interaction ----
@@ -1224,6 +1255,82 @@
 
   // ---- train animation loop ----
   let lastTick = null;
+  function stationList() { return facilities.filter(f => f.kind === 'station'); }
+
+  function passengerSpawnPos(f) {
+    const c = facilityPlatformCenter(f, 1);
+    const along = (Math.random() - 0.5) * (TRAIN_LENGTH - 20);
+    const across = (Math.random() - 0.5) * (PLATFORM_WIDTH - 10);
+    return {
+      x: c.x + Math.cos(f.angle) * along - Math.sin(f.angle) * across,
+      y: c.y + Math.sin(f.angle) * along + Math.cos(f.angle) * across,
+    };
+  }
+
+  function spawnPassenger() {
+    const stations = stationList();
+    if (stations.length < 2) return;
+    const origin = stations[Math.floor(Math.random() * stations.length)];
+    let dest;
+    do { dest = stations[Math.floor(Math.random() * stations.length)]; } while (dest.id === origin.id);
+    const pos = passengerSpawnPos(origin);
+    passengers.push({
+      id: uid(),
+      originId: origin.id, destId: dest.id, atStationId: origin.id,
+      state: 'waiting', x: pos.x, y: pos.y,
+      color: PASSENGER_COLORS[Math.floor(Math.random() * PASSENGER_COLORS.length)],
+      trainId: null, walk: null,
+    });
+  }
+
+  // A waiting passenger walks directly to their destination if it's a
+  // nearby station; otherwise they stay put until a train that will reach
+  // it dwells here (handleStationStop below boards them onto it).
+  function tickPassenger(p, dt) {
+    if (p.state === 'waiting') {
+      if (p.atStationId === p.destId) { p.state = 'arrived'; return; }
+      const originF = getFacility(p.atStationId);
+      const destF = getFacility(p.destId);
+      if (!originF || !destF) { p.state = 'arrived'; return; }
+      const oc = facilityPlatformCenter(originF, 1), dc = facilityPlatformCenter(destF, 1);
+      const dist = Math.hypot(dc.x - oc.x, dc.y - oc.y);
+      if (dist <= WALK_DISTANCE) {
+        p.state = 'walking';
+        p.walk = { fromId: p.atStationId, toId: p.destId, t: 0, duration: Math.max(1, dist / WALK_SPEED) };
+      }
+    } else if (p.state === 'walking') {
+      p.walk.t += dt;
+      const frac = Math.min(1, p.walk.t / p.walk.duration);
+      const originF = getFacility(p.walk.fromId), destF = getFacility(p.walk.toId);
+      if (!originF || !destF) { p.state = 'arrived'; return; }
+      const oc = facilityPlatformCenter(originF, 1), dc = facilityPlatformCenter(destF, 1);
+      p.x = oc.x + (dc.x - oc.x) * frac;
+      p.y = oc.y + (dc.y - oc.y) * frac;
+      if (frac >= 1) {
+        p.atStationId = p.walk.toId;
+        p.walk = null;
+        p.state = 'waiting';
+      }
+    }
+  }
+
+  // Called whenever a train dwells at a station: drop off any passengers
+  // riding it whose destination is here, then board waiting passengers this
+  // train's route will eventually carry to their own destination.
+  function handleStationStop(tr, facilityId) {
+    if (facilityId == null) return;
+    passengers = passengers.filter(p => !(p.state === 'riding' && p.trainId === tr.id && p.destId === facilityId));
+    const reachable = new Set(tr.stationStops.map(st => st.facilityId));
+    if (tr.startFacilityId != null) reachable.add(tr.startFacilityId);
+    if (tr.endFacilityId != null) reachable.add(tr.endFacilityId);
+    for (const p of passengers) {
+      if (p.state === 'waiting' && p.atStationId === facilityId && reachable.has(p.destId)) {
+        p.state = 'riding';
+        p.trainId = tr.id;
+      }
+    }
+  }
+
   function tickTrain(tr, dt) {
     if (tr.state === 'waiting') {
       tr.waitTimer -= dt;
@@ -1254,6 +1361,7 @@
       tr.waitTimer = STOP_SECONDS;
       tr.pendingDir = tr.dir; // same direction after a station dwell
       tr.lastStopDist = stopHit.dist;
+      handleStationStop(tr, stopHit.facilityId);
       return;
     }
 
@@ -1263,12 +1371,14 @@
       tr.waitTimer = STOP_SECONDS;
       tr.pendingDir = -1;
       tr.lastStopDist = null;
+      handleStationStop(tr, tr.endFacilityId);
     } else if (nextPos <= 0) {
       tr.pos = 0;
       tr.state = 'waiting';
       tr.waitTimer = STOP_SECONDS;
       tr.pendingDir = 1;
       tr.lastStopDist = null;
+      handleStationStop(tr, tr.startFacilityId);
     } else {
       tr.pos = nextPos;
       if (tr.lastStopDist != null && Math.abs(tr.pos - tr.lastStopDist) > 4) tr.lastStopDist = null;
@@ -1278,10 +1388,18 @@
   function animate(ts) {
     if (lastTick != null) {
       const dt = Math.min(0.05, (ts - lastTick) / 1000);
-      if (trains.length > 0) {
-        for (const tr of trains) tickTrain(tr, dt);
-        draw();
+
+      for (const tr of trains) tickTrain(tr, dt);
+
+      passengerSpawnTimer += dt;
+      if (passengerSpawnTimer >= PASSENGER_SPAWN_SECONDS) {
+        passengerSpawnTimer = 0;
+        spawnPassenger();
       }
+      for (const p of passengers) tickPassenger(p, dt);
+      passengers = passengers.filter(p => p.state !== 'arrived');
+
+      if (trains.length > 0 || passengers.length > 0) draw();
     }
     lastTick = ts;
     requestAnimationFrame(animate);
