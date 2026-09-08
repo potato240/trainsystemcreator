@@ -1,27 +1,524 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Train System Creator</title>
-  <style>
-    body {
-      margin: 0;
-      font-family: system-ui, sans-serif;
-      background: #0f1115;
-      color: #e6e6e6;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      height: 100vh;
-    }
-    h1 {
-      font-weight: 500;
-      letter-spacing: 0.02em;
-    }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Train System Creator</title>
+<style>
+  :root {
+    --amber: #e8a33d;
+    --amber-dark: #c07f22;
+    --green: #3f7d4a;
+    --green-dark: #35643d;
+    --panel: rgba(30, 26, 20, 0.88);
+    --panel-border: #5a4a34;
+    --ink: #f4ead9;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: #2b4a2f;
+  }
+  #canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    cursor: crosshair;
+  }
+  #toolbar {
+    position: fixed;
+    top: 14px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--panel);
+    border: 2px solid var(--panel-border);
+    border-radius: 12px;
+    padding: 8px 10px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+    z-index: 10;
+  }
+  #toolbar .brand {
+    color: var(--amber);
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: 0.03em;
+    padding: 0 10px 0 4px;
+    border-right: 1px solid var(--panel-border);
+    margin-right: 4px;
+    white-space: nowrap;
+  }
+  button.tool {
+    background: #3a2f22;
+    color: var(--ink);
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 7px 12px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background 0.12s, transform 0.05s;
+    white-space: nowrap;
+  }
+  button.tool:hover { background: #4a3d2c; }
+  button.tool:active { transform: scale(0.96); }
+  button.tool.active {
+    background: var(--amber);
+    color: #2b1f0e;
+    border-color: var(--amber-dark);
+    font-weight: 600;
+  }
+  button.tool.danger { color: #e8734d; }
+  button.tool.danger:hover { background: #4d2c22; }
+
+  #hint {
+    position: fixed;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    color: var(--ink);
+    font-size: 12.5px;
+    padding: 8px 14px;
+    border-radius: 10px;
+    z-index: 10;
+    pointer-events: none;
+    max-width: 90vw;
+    text-align: center;
+  }
+  #stats {
+    position: fixed;
+    top: 14px;
+    right: 14px;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    color: var(--ink);
+    font-size: 12px;
+    padding: 8px 12px;
+    border-radius: 10px;
+    z-index: 10;
+    line-height: 1.5;
+  }
+</style>
 </head>
 <body>
-  <h1>Train System Creator</h1>
+  <canvas id="canvas"></canvas>
+
+  <div id="toolbar">
+    <span class="brand">🚆 Track Editor</span>
+    <button class="tool active" data-mode="node">Add Node</button>
+    <button class="tool" data-mode="connect">Connect</button>
+    <button class="tool" data-mode="select">Select / Move</button>
+    <button class="tool danger" id="clearBtn">Clear All</button>
+  </div>
+
+  <div id="stats">Nodes: <span id="nodeCount">0</span><br>Tracks: <span id="trackCount">0</span></div>
+
+  <div id="hint">Click empty ground to place a rail node.</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const hint = document.getElementById('hint');
+  const nodeCountEl = document.getElementById('nodeCount');
+  const trackCountEl = document.getElementById('trackCount');
+  const STORAGE_KEY = 'tsc_track_state_v1';
+
+  function resize() {
+    canvas.width = window.innerWidth * devicePixelRatio;
+    canvas.height = window.innerHeight * devicePixelRatio;
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+    draw();
+  }
+  window.addEventListener('resize', resize);
+
+  // ---- state ----
+  let nodes = [];       // {id, x, y}
+  let tracks = [];      // {id, aId, bId, c1off:{x,y}, c2off:{x,y}}
+  let nextId = 1;
+
+  let mode = 'node';
+  let pendingConnectNode = null;
+  let selected = null; // {type:'node'|'track', id}
+  let dragging = null; // {type:'node', id} | {type:'handle', trackId, which:'c1'|'c2'}
+  let mouse = { x: 0, y: 0 };
+
+  function uid() { return nextId++; }
+  function getNode(id) { return nodes.find(n => n.id === id); }
+  function getTrack(id) { return tracks.find(t => t.id === id); }
+
+  function save() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, tracks, nextId }));
+  }
+  function load() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const data = JSON.parse(raw);
+      if (data.nodes && data.tracks) {
+        nodes = data.nodes;
+        tracks = data.tracks;
+        nextId = data.nextId || (Math.max(0, ...nodes.map(n=>n.id), ...tracks.map(t=>t.id)) + 1);
+      }
+    } catch (e) { /* ignore corrupt state */ }
+  }
+
+  function addNode(x, y) {
+    const n = { id: uid(), x, y };
+    nodes.push(n);
+    save();
+    return n;
+  }
+
+  function addTrack(aId, bId) {
+    if (aId === bId) return;
+    if (tracks.some(t => (t.aId === aId && t.bId === bId) || (t.aId === bId && t.bId === aId))) return;
+    const a = getNode(aId), b = getNode(bId);
+    const dx = (b.x - a.x) / 3, dy = (b.y - a.y) / 3;
+    tracks.push({
+      id: uid(), aId, bId,
+      c1off: { x: dx, y: dy },
+      c2off: { x: -dx, y: -dy },
+    });
+    save();
+  }
+
+  function deleteNode(id) {
+    nodes = nodes.filter(n => n.id !== id);
+    tracks = tracks.filter(t => t.aId !== id && t.bId !== id);
+    save();
+  }
+  function deleteTrack(id) {
+    tracks = tracks.filter(t => t.id !== id);
+    save();
+  }
+
+  // ---- geometry helpers ----
+  function bezierPt(t, p0, p1, p2, p3) {
+    const mt = 1 - t;
+    const a = mt * mt * mt, b = 3 * mt * mt * t, c = 3 * mt * t * t, d = t * t * t;
+    return {
+      x: a * p0.x + b * p1.x + c * p2.x + d * p3.x,
+      y: a * p0.y + b * p1.y + c * p2.y + d * p3.y,
+    };
+  }
+
+  function trackPoints(track, n = 40) {
+    const a = getNode(track.aId), b = getNode(track.bId);
+    if (!a || !b) return [];
+    const c1 = { x: a.x + track.c1off.x, y: a.y + track.c1off.y };
+    const c2 = { x: b.x + track.c2off.x, y: b.y + track.c2off.y };
+    const pts = [];
+    for (let i = 0; i <= n; i++) pts.push(bezierPt(i / n, a, c1, c2, b));
+    return pts;
+  }
+
+  function handlePositions(track) {
+    const a = getNode(track.aId), b = getNode(track.bId);
+    return {
+      c1: { x: a.x + track.c1off.x, y: a.y + track.c1off.y },
+      c2: { x: b.x + track.c2off.x, y: b.y + track.c2off.y },
+    };
+  }
+
+  function distToSegment(p, v, w) {
+    const l2 = (v.x - w.x) ** 2 + (v.y - w.y) ** 2;
+    if (l2 === 0) return Math.hypot(p.x - v.x, p.y - v.y);
+    let t = ((p.x - v.x) * (w.x - v.x) + (p.y - v.y) * (w.y - v.y)) / l2;
+    t = Math.max(0, Math.min(1, t));
+    const proj = { x: v.x + t * (w.x - v.x), y: v.y + t * (w.y - v.y) };
+    return Math.hypot(p.x - proj.x, p.y - proj.y);
+  }
+
+  function hitNode(x, y) {
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const n = nodes[i];
+      if (Math.hypot(n.x - x, n.y - y) <= 12) return n;
+    }
+    return null;
+  }
+
+  function hitHandle(x, y) {
+    if (!selected || selected.type !== 'track') return null;
+    const track = getTrack(selected.id);
+    if (!track) return null;
+    const h = handlePositions(track);
+    if (Math.hypot(h.c1.x - x, h.c1.y - y) <= 8) return { trackId: track.id, which: 'c1' };
+    if (Math.hypot(h.c2.x - x, h.c2.y - y) <= 8) return { trackId: track.id, which: 'c2' };
+    return null;
+  }
+
+  function hitTrack(x, y) {
+    let best = null, bestDist = 10;
+    for (const t of tracks) {
+      const pts = trackPoints(t, 24);
+      for (let i = 0; i < pts.length - 1; i++) {
+        const d = distToSegment({ x, y }, pts[i], pts[i + 1]);
+        if (d < bestDist) { bestDist = d; best = t; }
+      }
+    }
+    return best;
+  }
+
+  // ---- rendering ----
+  function drawGround(w, h) {
+    ctx.fillStyle = '#3f7d4a';
+    ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = 'rgba(255,255,255,0.06)';
+    const grid = 48;
+    for (let x = 0; x < w; x += grid) {
+      for (let y = 0; y < h; y += grid) {
+        ctx.beginPath();
+        ctx.arc(x, y, 1.6, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  function drawTrack(track, isSelected) {
+    const pts = trackPoints(track, 48);
+    if (pts.length < 2) return;
+
+    // ballast
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (const p of pts) ctx.lineTo(p.x, p.y);
+    ctx.strokeStyle = isSelected ? '#a68a5c' : '#8a7256';
+    ctx.lineWidth = 16;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+
+    // sleepers
+    let acc = 0;
+    const spacing = 16;
+    ctx.strokeStyle = '#5a3f28';
+    ctx.lineWidth = 5;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[i], p1 = pts[i + 1];
+      const segLen = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+      acc += segLen;
+      if (acc >= spacing) {
+        acc = 0;
+        const dx = p1.x - p0.x, dy = p1.y - p0.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const nx = -dy / len, ny = dx / len;
+        const half = 9;
+        ctx.beginPath();
+        ctx.moveTo(p1.x - nx * half, p1.y - ny * half);
+        ctx.lineTo(p1.x + nx * half, p1.y + ny * half);
+        ctx.stroke();
+      }
+    }
+
+    // rails (two parallel offset polylines)
+    for (const side of [-4, 4]) {
+      ctx.beginPath();
+      for (let i = 0; i < pts.length; i++) {
+        const p = pts[i];
+        const prev = pts[i - 1] || p;
+        const next = pts[i + 1] || p;
+        const dx = next.x - prev.x, dy = next.y - prev.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const nx = -dy / len, ny = dx / len;
+        const ox = p.x + nx * side, oy = p.y + ny * side;
+        if (i === 0) ctx.moveTo(ox, oy); else ctx.lineTo(ox, oy);
+      }
+      ctx.strokeStyle = isSelected ? '#fff2c9' : '#d9d2c2';
+      ctx.lineWidth = 2.2;
+      ctx.stroke();
+    }
+
+    if (isSelected) {
+      const h = handlePositions(track);
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+      ctx.lineWidth = 1.5;
+      const a = getNode(track.aId), b = getNode(track.bId);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(h.c1.x, h.c1.y); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(h.c2.x, h.c2.y); ctx.stroke();
+      for (const p of [h.c1, h.c2]) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+        ctx.fillStyle = '#5cb3e8';
+        ctx.fill();
+        ctx.strokeStyle = '#1c4e6b';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+    }
+  }
+
+  function drawNode(node, isSelected, isPending) {
+    // shadow pad
+    ctx.beginPath();
+    ctx.ellipse(node.x, node.y + 2, 12, 9, 0, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.22)';
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(node.x, node.y, 9, 0, Math.PI * 2);
+    ctx.fillStyle = isPending ? '#5cb3e8' : (isSelected ? '#ffd27a' : '#e8a33d');
+    ctx.fill();
+    ctx.strokeStyle = '#3a2410';
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(node.x, node.y, 3, 0, Math.PI * 2);
+    ctx.fillStyle = '#3a2410';
+    ctx.fill();
+  }
+
+  function draw() {
+    const w = window.innerWidth, h = window.innerHeight;
+    drawGround(w, h);
+
+    for (const t of tracks) {
+      drawTrack(t, selected && selected.type === 'track' && selected.id === t.id);
+    }
+    for (const n of nodes) {
+      const isSelected = selected && selected.type === 'node' && selected.id === n.id;
+      const isPending = pendingConnectNode === n.id;
+      drawNode(n, isSelected, isPending);
+    }
+
+    nodeCountEl.textContent = nodes.length;
+    trackCountEl.textContent = tracks.length;
+  }
+
+  // ---- interaction ----
+  function setMode(m) {
+    mode = m;
+    pendingConnectNode = null;
+    selected = null;
+    document.querySelectorAll('button.tool[data-mode]').forEach(b => {
+      b.classList.toggle('active', b.dataset.mode === m);
+    });
+    updateHint();
+    draw();
+  }
+
+  function updateHint() {
+    if (mode === 'node') hint.textContent = 'Click empty ground to place a rail node.';
+    else if (mode === 'connect') hint.textContent = pendingConnectNode
+      ? 'Now click a second node to lay track between them.'
+      : 'Click a node to start a connection.';
+    else if (mode === 'select') hint.textContent = 'Drag nodes to move them. Click a track to bend it (drag blue handles). Press Delete to remove selection.';
+  }
+
+  document.querySelectorAll('button.tool[data-mode]').forEach(b => {
+    b.addEventListener('click', () => setMode(b.dataset.mode));
+  });
+  document.getElementById('clearBtn').addEventListener('click', () => {
+    if (nodes.length === 0 && tracks.length === 0) return;
+    if (confirm('Clear the entire track layout?')) {
+      nodes = []; tracks = []; selected = null; pendingConnectNode = null;
+      save(); draw();
+    }
+  });
+
+  function getMousePos(e) {
+    const rect = canvas.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+
+  canvas.addEventListener('mousedown', (e) => {
+    const p = getMousePos(e);
+
+    if (mode === 'node') {
+      if (!hitNode(p.x, p.y)) addNode(p.x, p.y);
+      draw();
+      return;
+    }
+
+    if (mode === 'connect') {
+      const n = hitNode(p.x, p.y);
+      if (!n) { pendingConnectNode = null; updateHint(); draw(); return; }
+      if (pendingConnectNode === null) {
+        pendingConnectNode = n.id;
+      } else if (pendingConnectNode === n.id) {
+        pendingConnectNode = null;
+      } else {
+        addTrack(pendingConnectNode, n.id);
+        pendingConnectNode = null;
+      }
+      updateHint();
+      draw();
+      return;
+    }
+
+    if (mode === 'select') {
+      const h = hitHandle(p.x, p.y);
+      if (h) { dragging = { type: 'handle', ...h }; return; }
+
+      const n = hitNode(p.x, p.y);
+      if (n) {
+        selected = { type: 'node', id: n.id };
+        dragging = { type: 'node', id: n.id };
+        draw();
+        return;
+      }
+
+      const t = hitTrack(p.x, p.y);
+      if (t) {
+        selected = { type: 'track', id: t.id };
+        draw();
+        return;
+      }
+
+      selected = null;
+      draw();
+    }
+  });
+
+  canvas.addEventListener('mousemove', (e) => {
+    mouse = getMousePos(e);
+    if (!dragging) return;
+
+    if (dragging.type === 'node') {
+      const n = getNode(dragging.id);
+      if (n) { n.x = mouse.x; n.y = mouse.y; draw(); }
+    } else if (dragging.type === 'handle') {
+      const t = getTrack(dragging.trackId);
+      if (!t) return;
+      if (dragging.which === 'c1') {
+        const a = getNode(t.aId);
+        t.c1off = { x: mouse.x - a.x, y: mouse.y - a.y };
+      } else {
+        const b = getNode(t.bId);
+        t.c2off = { x: mouse.x - b.x, y: mouse.y - b.y };
+      }
+      draw();
+    }
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (dragging) { dragging = null; save(); }
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if ((e.key === 'Delete' || e.key === 'Backspace') && selected) {
+      if (selected.type === 'node') deleteNode(selected.id);
+      else if (selected.type === 'track') deleteTrack(selected.id);
+      selected = null;
+      draw();
+    }
+  });
+
+  load();
+  resize();
+  setMode('node');
+})();
+</script>
 </body>
 </html>
