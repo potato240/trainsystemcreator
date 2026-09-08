@@ -189,18 +189,75 @@
       id: uid(), aId, bId,
       c1off: { x: dx, y: dy },
       c2off: { x: -dx, y: -dy },
+      c1locked: false,
+      c2locked: false,
     });
+    recomputeAutoTangents();
     save();
   }
 
   function deleteNode(id) {
     nodes = nodes.filter(n => n.id !== id);
     tracks = tracks.filter(t => t.aId !== id && t.bId !== id);
+    recomputeAutoTangents();
     save();
   }
   function deleteTrack(id) {
     tracks = tracks.filter(t => t.id !== id);
+    recomputeAutoTangents();
     save();
+  }
+
+  // For a node with exactly two connections, align both tracks' tangents so
+  // the curve flows straight through instead of kinking at the node. Nodes
+  // with one connection aim at their only neighbor; junctions (3+) fall back
+  // to aiming straight at each neighbor since no single tangent fits all of
+  // them. Handles the user has manually dragged (locked) are left alone.
+  function nodeNeighbors(nodeId) {
+    const list = [];
+    for (const t of tracks) {
+      if (t.aId === nodeId) list.push({ track: t, otherId: t.bId, end: 'a' });
+      else if (t.bId === nodeId) list.push({ track: t, otherId: t.aId, end: 'b' });
+    }
+    return list;
+  }
+
+  function recomputeAutoTangents() {
+    for (const node of nodes) {
+      const neigh = nodeNeighbors(node.id);
+      if (neigh.length === 0) continue;
+
+      let tangent = null;
+      if (neigh.length === 1) {
+        const other = getNode(neigh[0].otherId);
+        tangent = { x: other.x - node.x, y: other.y - node.y };
+      } else if (neigh.length === 2) {
+        const oA = getNode(neigh[0].otherId), oB = getNode(neigh[1].otherId);
+        tangent = { x: oB.x - oA.x, y: oB.y - oA.y };
+      }
+
+      for (const n of neigh) {
+        const lockedKey = n.end === 'a' ? 'c1locked' : 'c2locked';
+        if (n.track[lockedKey]) continue;
+
+        const other = getNode(n.otherId);
+        const toOther = { x: other.x - node.x, y: other.y - node.y };
+        const dist = Math.hypot(toOther.x, toOther.y) || 1;
+
+        let dir;
+        if (tangent) {
+          const len = Math.hypot(tangent.x, tangent.y) || 1;
+          dir = { x: tangent.x / len, y: tangent.y / len };
+          if (dir.x * toOther.x + dir.y * toOther.y < 0) { dir.x *= -1; dir.y *= -1; }
+        } else {
+          dir = { x: toOther.x / dist, y: toOther.y / dist };
+        }
+
+        const mag = dist / 3;
+        const off = { x: dir.x * mag, y: dir.y * mag };
+        if (n.end === 'a') n.track.c1off = off; else n.track.c2off = off;
+      }
+    }
   }
 
   // ---- geometry helpers ----
@@ -487,16 +544,18 @@
 
     if (dragging.type === 'node') {
       const n = getNode(dragging.id);
-      if (n) { n.x = mouse.x; n.y = mouse.y; draw(); }
+      if (n) { n.x = mouse.x; n.y = mouse.y; recomputeAutoTangents(); draw(); }
     } else if (dragging.type === 'handle') {
       const t = getTrack(dragging.trackId);
       if (!t) return;
       if (dragging.which === 'c1') {
         const a = getNode(t.aId);
         t.c1off = { x: mouse.x - a.x, y: mouse.y - a.y };
+        t.c1locked = true;
       } else {
         const b = getNode(t.bId);
         t.c2off = { x: mouse.x - b.x, y: mouse.y - b.y };
+        t.c2locked = true;
       }
       draw();
     }
@@ -516,6 +575,7 @@
   });
 
   load();
+  recomputeAutoTangents();
   resize();
   setMode('node');
 })();
