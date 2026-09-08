@@ -168,13 +168,15 @@
     <button class="tool" data-mode="station">Add Station</button>
     <button class="tool" data-mode="depot">Add Depot</button>
     <button class="tool" data-mode="route">Route</button>
+    <button class="tool" data-mode="road">Add Road</button>
+    <button class="tool" data-mode="crossing">Add Crossing</button>
     <button class="tool" data-mode="select">Select / Move</button>
     <button class="tool toggle" id="doubleToggle">Double Track: Off</button>
     <button class="tool" id="spawnBtn">Spawn Train</button>
     <button class="tool danger" id="clearBtn">Clear All</button>
   </div>
 
-  <div id="stats">Nodes: <span id="nodeCount">0</span><br>Tracks: <span id="trackCount">0</span><br>Facilities: <span id="facilityCount">0</span><br>Trains: <span id="trainCount">0</span><br>Passengers: <span id="passengerCount">0</span></div>
+  <div id="stats">Nodes: <span id="nodeCount">0</span><br>Tracks: <span id="trackCount">0</span><br>Facilities: <span id="facilityCount">0</span><br>Trains: <span id="trainCount">0</span><br>Passengers: <span id="passengerCount">0</span><br>Roads: <span id="roadCount">0</span></div>
 
   <div id="hint">Click empty ground to place a rail node.</div>
 
@@ -188,6 +190,7 @@
   const facilityCountEl = document.getElementById('facilityCount');
   const trainCountEl = document.getElementById('trainCount');
   const passengerCountEl = document.getElementById('passengerCount');
+  const roadCountEl = document.getElementById('roadCount');
   const STORAGE_KEY = 'tsc_track_state_v2';
 
   // Reference rolling stock: a 4-car Southeastern Class 375 "Electrostar" EMU.
@@ -211,6 +214,7 @@
   const WALK_DISTANCE = 260; // px - stations this close are walkable directly
   const PASSENGER_SPAWN_SECONDS = 4;
   const PASSENGER_COLORS = ['#e8734d', '#5cb3e8', '#8bd17c', '#e8c93d', '#c78be8', '#f2946b'];
+  const GRID_SIZE = 40; // roads snap to this grid and may only run in the 8 grid directions
 
   function resize() {
     canvas.width = window.innerWidth * devicePixelRatio;
@@ -229,13 +233,16 @@
   let trains = [];      // {id, depotId, path:[nodeId...], pts, cum, total, pos, dir, speed}
   let passengers = [];  // {id, originId, destId, atStationId, state, x, y, color, trainId, walk}
   let passengerSpawnTimer = 0;
+  let roadNodes = [];   // {id, x, y} - always grid-snapped
+  let roadSegments = []; // {id, aId, bId} - straight, one of the 8 grid directions
   let nextId = 1;
 
   let mode = 'node';
   let doubleTrack = false;
   let pendingConnectNode = null;
   let pendingRoute = null; // {depotId, path:[nodeId...]}
-  let selected = null; // {type:'node'|'track'|'facility', id}
+  let lastRoadNodeId = null; // chains consecutive clicks in Add Road mode into a polyline
+  let selected = null; // {type:'node'|'track'|'facility'|'roadNode'|'roadSegment', id}
   let dragging = null;
   let mouse = { x: 0, y: 0 };
   let livery = { roof: '#d7dbda', side: '#1d4f91', cab: '#e8c93d' };
@@ -244,9 +251,13 @@
   function getNode(id) { return nodes.find(n => n.id === id); }
   function getTrack(id) { return tracks.find(t => t.id === id); }
   function getFacility(id) { return facilities.find(f => f.id === id); }
+  function getRoadNode(id) { return roadNodes.find(n => n.id === id); }
+  function getRoadSegment(id) { return roadSegments.find(s => s.id === id); }
 
   function save() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, tracks, facilities, trains, nextId, livery }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      nodes, tracks, facilities, trains, nextId, livery, roadNodes, roadSegments,
+    }));
   }
   function load() {
     try {
@@ -258,10 +269,13 @@
         tracks = data.tracks;
         facilities = data.facilities || [];
         trains = data.trains || [];
+        roadNodes = data.roadNodes || [];
+        roadSegments = data.roadSegments || [];
         if (data.livery) livery = { ...livery, ...data.livery };
         nextId = data.nextId || (Math.max(0,
           ...nodes.map(n => n.id), ...tracks.map(t => t.id),
-          ...facilities.map(f => f.id), ...trains.map(t => t.id)) + 1);
+          ...facilities.map(f => f.id), ...trains.map(t => t.id),
+          ...roadNodes.map(n => n.id), ...roadSegments.map(s => s.id)) + 1);
       }
     } catch (e) { /* ignore corrupt state */ }
   }
@@ -310,6 +324,50 @@
     facilities = facilities.filter(f => f.trackId !== id);
     pruneInvalidTrains();
     recomputeAutoTangents();
+    save();
+  }
+
+  // Roads snap to a fixed grid and may only run in the 8 grid directions
+  // (N/S/E/W and the 4 diagonals) - straight segments between grid points.
+  function snapToGrid(x, y) {
+    return { x: Math.round(x / GRID_SIZE) * GRID_SIZE, y: Math.round(y / GRID_SIZE) * GRID_SIZE };
+  }
+
+  function isGridDirection(a, b) {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    if (dx === 0 && dy === 0) return false;
+    return dx === 0 || dy === 0 || Math.abs(dx) === Math.abs(dy);
+  }
+
+  function addRoadNode(x, y) {
+    const p = snapToGrid(x, y);
+    const existing = roadNodes.find(n => n.x === p.x && n.y === p.y);
+    if (existing) return existing;
+    const n = { id: uid(), x: p.x, y: p.y };
+    roadNodes.push(n);
+    save();
+    return n;
+  }
+
+  function addRoadSegment(aId, bId) {
+    if (aId === bId) return null;
+    const existing = roadSegments.find(s => (s.aId === aId && s.bId === bId) || (s.aId === bId && s.bId === aId));
+    if (existing) return existing;
+    const a = getRoadNode(aId), b = getRoadNode(bId);
+    if (!isGridDirection(a, b)) return null;
+    const seg = { id: uid(), aId, bId };
+    roadSegments.push(seg);
+    save();
+    return seg;
+  }
+
+  function deleteRoadNode(id) {
+    roadNodes = roadNodes.filter(n => n.id !== id);
+    roadSegments = roadSegments.filter(s => s.aId !== id && s.bId !== id);
+    save();
+  }
+  function deleteRoadSegment(id) {
+    roadSegments = roadSegments.filter(s => s.id !== id);
     save();
   }
 
@@ -604,6 +662,25 @@
     return best;
   }
 
+  function hitRoadNode(x, y) {
+    for (let i = roadNodes.length - 1; i >= 0; i--) {
+      const n = roadNodes[i];
+      if (Math.hypot(n.x - x, n.y - y) <= 10) return n;
+    }
+    return null;
+  }
+
+  function hitRoadSegment(x, y) {
+    let best = null, bestDist = 8;
+    for (const s of roadSegments) {
+      const a = getRoadNode(s.aId), b = getRoadNode(s.bId);
+      if (!a || !b) continue;
+      const d = distToSegment({ x, y }, a, b);
+      if (d < bestDist) { bestDist = d; best = s; }
+    }
+    return best;
+  }
+
   // Platform/shed center for one side of a facility ('side' is +1 or -1);
   // doubled facilities push the offset out past the second rail lane.
   function facilityPlatformCenter(f, side) {
@@ -659,6 +736,82 @@
         ctx.fill();
       }
     }
+  }
+
+  function drawRoadSegment(seg, isSelected) {
+    const a = getRoadNode(seg.aId), b = getRoadNode(seg.bId);
+    if (!a || !b) return;
+    ctx.strokeStyle = isSelected ? '#5a5a5a' : '#403f3d';
+    ctx.lineWidth = 20;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+
+    ctx.strokeStyle = isSelected ? '#fff2c9' : '#e8d98a';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([10, 10]);
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  function drawRoadNode(node, isSelected) {
+    ctx.beginPath();
+    ctx.arc(node.x, node.y, 5, 0, Math.PI * 2);
+    ctx.fillStyle = isSelected ? '#fff2c9' : '#5a5a58';
+    ctx.fill();
+  }
+
+  // A level crossing is a rail node flagged .crossing - render red/white
+  // hazard stripes across the track there, perpendicular to whichever way
+  // the track runs through it, plus short barrier arms on each side.
+  function drawCrossing(node) {
+    const neigh = nodeNeighbors(node.id);
+    let angle = 0;
+    if (neigh.length > 0) {
+      const other = getNode(neigh[0].otherId);
+      angle = Math.atan2(other.y - node.y, other.x - node.x);
+    }
+    const perp = angle + Math.PI / 2;
+    const barLen = 26;
+
+    ctx.save();
+    ctx.translate(node.x, node.y);
+    ctx.rotate(perp);
+
+    // road surface patch with diagonal hazard stripes
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(-11, -barLen, 22, barLen * 2);
+    ctx.clip();
+    ctx.fillStyle = '#403f3d';
+    ctx.fillRect(-11, -barLen, 22, barLen * 2);
+    ctx.strokeStyle = '#e8c93d';
+    ctx.lineWidth = 6;
+    for (let s = -barLen * 2; s < 22; s += 12) {
+      ctx.beginPath();
+      ctx.moveTo(s, -barLen);
+      ctx.lineTo(s + barLen * 2, barLen);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // striped barrier arms, angled up on each side
+    for (const side of [-1, 1]) {
+      ctx.save();
+      ctx.translate(0, side * (barLen + 4));
+      ctx.rotate(side * -0.35);
+      for (let i = 0; i < 4; i++) {
+        ctx.fillStyle = i % 2 === 0 ? '#e8c93d' : '#c0392b';
+        ctx.fillRect(-3, side > 0 ? -18 - i * 9 : i * 9, 6, 9);
+      }
+      ctx.restore();
+    }
+    ctx.restore();
   }
 
   function drawTrackLane(pts, isSelected) {
@@ -982,6 +1135,12 @@
     const w = window.innerWidth, h = window.innerHeight;
     drawGround(w, h);
 
+    for (const s of roadSegments) {
+      drawRoadSegment(s, selected && selected.type === 'roadSegment' && selected.id === s.id);
+    }
+    for (const n of roadNodes) {
+      drawRoadNode(n, selected && selected.type === 'roadNode' && selected.id === n.id);
+    }
     for (const t of tracks) {
       drawTrack(t, selected && selected.type === 'track' && selected.id === t.id);
     }
@@ -993,6 +1152,7 @@
       const isSelected = selected && selected.type === 'node' && selected.id === n.id;
       const isPending = pendingConnectNode === n.id;
       drawNode(n, isSelected, isPending);
+      if (n.crossing) drawCrossing(n);
     }
     for (const tr of trains) {
       drawArticulatedTrain(makeRouteSampler(tr));
@@ -1008,12 +1168,29 @@
       drawFacility({ x: dragging.cx, y: dragging.cy, angle: dragging.angle, kind: dragging.kind, double: doubleTrack }, false);
       ctx.globalAlpha = 1;
     }
+    if (mode === 'road' && lastRoadNodeId != null && mouse) {
+      const start = getRoadNode(lastRoadNodeId);
+      if (start) {
+        const snapped = snapToGrid(mouse.x, mouse.y);
+        ctx.globalAlpha = 0.5;
+        ctx.strokeStyle = isGridDirection(start, snapped) ? '#e8d98a' : '#e8734d';
+        ctx.lineWidth = 6;
+        ctx.setLineDash([6, 6]);
+        ctx.beginPath();
+        ctx.moveTo(start.x, start.y);
+        ctx.lineTo(snapped.x, snapped.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+      }
+    }
 
     nodeCountEl.textContent = nodes.length;
     trackCountEl.textContent = tracks.length;
     facilityCountEl.textContent = facilities.length;
     trainCountEl.textContent = trains.length;
     passengerCountEl.textContent = passengers.length;
+    roadCountEl.textContent = roadSegments.length;
   }
 
   // ---- interaction ----
@@ -1021,6 +1198,7 @@
     mode = m;
     pendingConnectNode = null;
     if (m !== 'route') pendingRoute = null;
+    if (m !== 'road') lastRoadNodeId = null;
     selected = null;
     document.querySelectorAll('button.tool[data-mode]').forEach(b => {
       b.classList.toggle('active', b.dataset.mode === m);
@@ -1039,6 +1217,8 @@
     else if (mode === 'route') hint.textContent = pendingRoute
       ? `Route has ${pendingRoute.path.length} stop(s) - click more nodes to extend it, or press Spawn Train. Esc to cancel.`
       : 'Click a depot\'s track node to start a route.';
+    else if (mode === 'road') hint.textContent = 'Click to place a road point on the grid. Click another point in one of the 8 grid directions (N/S/E/W or diagonal) to pave a road between them - keeps chaining from the last point. Esc to break the chain.';
+    else if (mode === 'crossing') hint.textContent = 'Click a rail node to toggle a level crossing there.';
     else if (mode === 'select') hint.textContent = 'Drag nodes or facilities to move them. Click a track to bend it, or a facility to rotate it (drag blue handles). Press Delete to remove selection.';
   }
 
@@ -1077,10 +1257,11 @@
   });
 
   document.getElementById('clearBtn').addEventListener('click', () => {
-    if (nodes.length === 0 && tracks.length === 0 && facilities.length === 0 && trains.length === 0) return;
+    if (nodes.length === 0 && tracks.length === 0 && facilities.length === 0 && trains.length === 0
+      && roadNodes.length === 0 && roadSegments.length === 0) return;
     if (confirm('Clear the entire track layout?')) {
-      nodes = []; tracks = []; facilities = []; trains = [];
-      selected = null; pendingConnectNode = null; pendingRoute = null;
+      nodes = []; tracks = []; facilities = []; trains = []; roadNodes = []; roadSegments = [];
+      selected = null; pendingConnectNode = null; pendingRoute = null; lastRoadNodeId = null;
       save(); draw();
     }
   });
@@ -1143,6 +1324,31 @@
       return;
     }
 
+    if (mode === 'road') {
+      const snapped = snapToGrid(p.x, p.y);
+      const node = addRoadNode(snapped.x, snapped.y);
+      if (lastRoadNodeId != null && lastRoadNodeId !== node.id) {
+        const start = getRoadNode(lastRoadNodeId);
+        if (isGridDirection(start, node)) {
+          addRoadSegment(lastRoadNodeId, node.id);
+        } else {
+          hint.textContent = 'That point isn\'t on one of the 8 grid directions from the last one - starting a new road there instead.';
+        }
+      }
+      lastRoadNodeId = node.id;
+      draw();
+      return;
+    }
+
+    if (mode === 'crossing') {
+      const n = hitNode(p.x, p.y);
+      if (!n) { hint.textContent = 'Click an existing rail node to toggle a level crossing.'; return; }
+      n.crossing = !n.crossing;
+      save();
+      draw();
+      return;
+    }
+
     if (mode === 'select') {
       const h = hitHandle(p.x, p.y);
       if (h) { dragging = { type: 'handle', ...h }; return; }
@@ -1173,6 +1379,20 @@
         return;
       }
 
+      const rn = hitRoadNode(p.x, p.y);
+      if (rn) {
+        selected = { type: 'roadNode', id: rn.id };
+        draw();
+        return;
+      }
+
+      const rs = hitRoadSegment(p.x, p.y);
+      if (rs) {
+        selected = { type: 'roadSegment', id: rs.id };
+        draw();
+        return;
+      }
+
       selected = null;
       draw();
     }
@@ -1180,6 +1400,7 @@
 
   canvas.addEventListener('mousemove', (e) => {
     mouse = getMousePos(e);
+    if (mode === 'road' && lastRoadNodeId != null) draw();
     if (!dragging) return;
 
     if (dragging.type === 'node') {
@@ -1244,11 +1465,16 @@
       if (selected.type === 'node') deleteNode(selected.id);
       else if (selected.type === 'track') deleteTrack(selected.id);
       else if (selected.type === 'facility') deleteFacility(selected.id);
+      else if (selected.type === 'roadNode') deleteRoadNode(selected.id);
+      else if (selected.type === 'roadSegment') deleteRoadSegment(selected.id);
       selected = null;
       draw();
     } else if (e.key === 'Escape' && pendingRoute) {
       pendingRoute = null;
       updateHint();
+      draw();
+    } else if (e.key === 'Escape' && mode === 'road' && lastRoadNodeId != null) {
+      lastRoadNodeId = null;
       draw();
     }
   });
