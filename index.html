@@ -115,11 +115,12 @@
     <span class="brand">🚆 Track Editor</span>
     <button class="tool active" data-mode="node">Add Node</button>
     <button class="tool" data-mode="connect">Connect</button>
+    <button class="tool" data-mode="platform">Add Platform</button>
     <button class="tool" data-mode="select">Select / Move</button>
     <button class="tool danger" id="clearBtn">Clear All</button>
   </div>
 
-  <div id="stats">Nodes: <span id="nodeCount">0</span><br>Tracks: <span id="trackCount">0</span></div>
+  <div id="stats">Nodes: <span id="nodeCount">0</span><br>Tracks: <span id="trackCount">0</span><br>Platforms: <span id="platformCount">0</span></div>
 
   <div id="hint">Click empty ground to place a rail node.</div>
 
@@ -130,7 +131,18 @@
   const hint = document.getElementById('hint');
   const nodeCountEl = document.getElementById('nodeCount');
   const trackCountEl = document.getElementById('trackCount');
+  const platformCountEl = document.getElementById('platformCount');
   const STORAGE_KEY = 'tsc_track_state_v1';
+
+  // Reference rolling stock: a 4-car Southeastern Class 375 "Electrostar" EMU.
+  // Each car is ~20m in real life; platforms are locked to this total length
+  // so they can never be built shorter or longer than the train itself.
+  const TRAIN_CARS = 4;
+  const CAR_LENGTH = 42;
+  const TRAIN_LENGTH = CAR_LENGTH * TRAIN_CARS;
+  const TRAIN_WIDTH = 22;
+  const PLATFORM_WIDTH = 32;
+  const PLATFORM_GAP = 6;
 
   function resize() {
     canvas.width = window.innerWidth * devicePixelRatio;
@@ -145,20 +157,22 @@
   // ---- state ----
   let nodes = [];       // {id, x, y}
   let tracks = [];      // {id, aId, bId, c1off:{x,y}, c2off:{x,y}}
+  let platforms = [];   // {id, x, y, angle} - length is always TRAIN_LENGTH
   let nextId = 1;
 
   let mode = 'node';
   let pendingConnectNode = null;
-  let selected = null; // {type:'node'|'track', id}
-  let dragging = null; // {type:'node', id} | {type:'handle', trackId, which:'c1'|'c2'}
+  let selected = null; // {type:'node'|'track'|'platform', id}
+  let dragging = null; // {type:'node'|'platform', id} | {type:'handle', trackId, which} | {type:'platformHandle', id} | {type:'newPlatform', startX, startY, angle}
   let mouse = { x: 0, y: 0 };
 
   function uid() { return nextId++; }
   function getNode(id) { return nodes.find(n => n.id === id); }
   function getTrack(id) { return tracks.find(t => t.id === id); }
+  function getPlatform(id) { return platforms.find(p => p.id === id); }
 
   function save() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, tracks, nextId }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, tracks, platforms, nextId }));
   }
   function load() {
     try {
@@ -168,7 +182,8 @@
       if (data.nodes && data.tracks) {
         nodes = data.nodes;
         tracks = data.tracks;
-        nextId = data.nextId || (Math.max(0, ...nodes.map(n=>n.id), ...tracks.map(t=>t.id)) + 1);
+        platforms = data.platforms || [];
+        nextId = data.nextId || (Math.max(0, ...nodes.map(n=>n.id), ...tracks.map(t=>t.id), ...platforms.map(p=>p.id)) + 1);
       }
     } catch (e) { /* ignore corrupt state */ }
   }
@@ -205,6 +220,17 @@
   function deleteTrack(id) {
     tracks = tracks.filter(t => t.id !== id);
     recomputeAutoTangents();
+    save();
+  }
+
+  // Platforms are always exactly TRAIN_LENGTH long - only position and angle
+  // are adjustable, so they can never be built shorter or longer than the train.
+  function addPlatform(x, y, angle) {
+    platforms.push({ id: uid(), x, y, angle });
+    save();
+  }
+  function deletePlatform(id) {
+    platforms = platforms.filter(p => p.id !== id);
     save();
   }
 
@@ -327,6 +353,32 @@
     return best;
   }
 
+  function hitPlatform(x, y) {
+    for (let i = platforms.length - 1; i >= 0; i--) {
+      const p = platforms[i];
+      const dx = x - p.x, dy = y - p.y;
+      const cos = Math.cos(-p.angle), sin = Math.sin(-p.angle);
+      const lx = dx * cos - dy * sin, ly = dx * sin + dy * cos;
+      if (Math.abs(lx) <= TRAIN_LENGTH / 2 && Math.abs(ly) <= PLATFORM_WIDTH / 2) return p;
+    }
+    return null;
+  }
+
+  function platformHandlePos(p) {
+    return {
+      x: p.x + Math.cos(p.angle) * (TRAIN_LENGTH / 2 + 16),
+      y: p.y + Math.sin(p.angle) * (TRAIN_LENGTH / 2 + 16),
+    };
+  }
+
+  function hitPlatformHandle(x, y) {
+    if (!selected || selected.type !== 'platform') return null;
+    const p = getPlatform(selected.id);
+    if (!p) return null;
+    const h = platformHandlePos(p);
+    return Math.hypot(h.x - x, h.y - y) <= 8 ? p.id : null;
+  }
+
   // ---- rendering ----
   function drawGround(w, h) {
     ctx.fillStyle = '#3f7d4a';
@@ -415,6 +467,96 @@
     }
   }
 
+  function drawPlatform(p, isSelected) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.angle);
+
+    ctx.beginPath();
+    ctx.roundRect(-TRAIN_LENGTH / 2, -PLATFORM_WIDTH / 2, TRAIN_LENGTH, PLATFORM_WIDTH, 4);
+    ctx.fillStyle = isSelected ? '#cdc6b2' : '#b5ae9c';
+    ctx.fill();
+    ctx.strokeStyle = '#5a5548';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // trackside tactile edge strip
+    ctx.fillStyle = '#e8c93d';
+    ctx.fillRect(-TRAIN_LENGTH / 2 + 4, PLATFORM_WIDTH / 2 - 6, TRAIN_LENGTH - 8, 4);
+
+    ctx.restore();
+
+    if (isSelected) {
+      const h = platformHandlePos(p);
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(h.x, h.y);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(h.x, h.y, 7, 0, Math.PI * 2);
+      ctx.fillStyle = '#5cb3e8';
+      ctx.fill();
+      ctx.strokeStyle = '#1c4e6b';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+
+  // 4-car Class 375 "Electrostar" in Southeastern livery, docked alongside
+  // its platform so the fixed length reads clearly against the real train.
+  function drawTrain(p) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.angle);
+    ctx.translate(0, PLATFORM_WIDTH / 2 + PLATFORM_GAP + TRAIN_WIDTH / 2);
+
+    ctx.beginPath();
+    ctx.roundRect(-TRAIN_LENGTH / 2, -TRAIN_WIDTH / 2, TRAIN_LENGTH, TRAIN_WIDTH, 6);
+    ctx.fillStyle = '#eef1ef';
+    ctx.fill();
+    ctx.strokeStyle = '#1c1f22';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // window band
+    ctx.fillStyle = '#2f4a63';
+    ctx.fillRect(-TRAIN_LENGTH / 2 + 6, -TRAIN_WIDTH * 0.16, TRAIN_LENGTH - 12, TRAIN_WIDTH * 0.32);
+
+    // Southeastern blue skirt stripe
+    ctx.fillStyle = '#1d4f91';
+    ctx.fillRect(-TRAIN_LENGTH / 2 + 4, TRAIN_WIDTH / 2 - 4, TRAIN_LENGTH - 8, 3);
+
+    // car couplers
+    ctx.strokeStyle = '#9aa0a6';
+    ctx.lineWidth = 2;
+    for (let i = 1; i < TRAIN_CARS; i++) {
+      const carX = -TRAIN_LENGTH / 2 + i * CAR_LENGTH;
+      ctx.beginPath();
+      ctx.moveTo(carX, -TRAIN_WIDTH / 2 + 2);
+      ctx.lineTo(carX, TRAIN_WIDTH / 2 - 2);
+      ctx.stroke();
+    }
+
+    // yellow warning cab fronts
+    ctx.fillStyle = '#e8c93d';
+    ctx.fillRect(-TRAIN_LENGTH / 2, -TRAIN_WIDTH / 2, 6, TRAIN_WIDTH);
+    ctx.fillRect(TRAIN_LENGTH / 2 - 6, -TRAIN_WIDTH / 2, 6, TRAIN_WIDTH);
+
+    // pantograph on car 2
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 1.5;
+    const panX = -TRAIN_LENGTH / 2 + CAR_LENGTH * 1.5;
+    ctx.beginPath();
+    ctx.moveTo(panX - 6, -TRAIN_WIDTH / 2);
+    ctx.lineTo(panX, -TRAIN_WIDTH / 2 - 6);
+    ctx.lineTo(panX + 6, -TRAIN_WIDTH / 2);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
   function drawNode(node, isSelected, isPending) {
     // shadow pad
     ctx.beginPath();
@@ -443,14 +585,26 @@
     for (const t of tracks) {
       drawTrack(t, selected && selected.type === 'track' && selected.id === t.id);
     }
+    for (const p of platforms) {
+      const isSelected = selected && selected.type === 'platform' && selected.id === p.id;
+      drawPlatform(p, isSelected);
+      drawTrain(p);
+    }
     for (const n of nodes) {
       const isSelected = selected && selected.type === 'node' && selected.id === n.id;
       const isPending = pendingConnectNode === n.id;
       drawNode(n, isSelected, isPending);
     }
 
+    if (dragging && dragging.type === 'newPlatform') {
+      ctx.globalAlpha = 0.55;
+      drawPlatform({ x: dragging.cx, y: dragging.cy, angle: dragging.angle }, false);
+      ctx.globalAlpha = 1;
+    }
+
     nodeCountEl.textContent = nodes.length;
     trackCountEl.textContent = tracks.length;
+    platformCountEl.textContent = platforms.length;
   }
 
   // ---- interaction ----
@@ -470,16 +624,17 @@
     else if (mode === 'connect') hint.textContent = pendingConnectNode
       ? 'Now click a second node to lay track between them.'
       : 'Click a node to start a connection.';
-    else if (mode === 'select') hint.textContent = 'Drag nodes to move them. Click a track to bend it (drag blue handles). Press Delete to remove selection.';
+    else if (mode === 'platform') hint.textContent = 'Click and drag to lay a platform - length is locked to the train, drag only sets the angle.';
+    else if (mode === 'select') hint.textContent = 'Drag nodes or platforms to move them. Click a track to bend it, or a platform to rotate it (drag blue handles). Press Delete to remove selection.';
   }
 
   document.querySelectorAll('button.tool[data-mode]').forEach(b => {
     b.addEventListener('click', () => setMode(b.dataset.mode));
   });
   document.getElementById('clearBtn').addEventListener('click', () => {
-    if (nodes.length === 0 && tracks.length === 0) return;
+    if (nodes.length === 0 && tracks.length === 0 && platforms.length === 0) return;
     if (confirm('Clear the entire track layout?')) {
-      nodes = []; tracks = []; selected = null; pendingConnectNode = null;
+      nodes = []; tracks = []; platforms = []; selected = null; pendingConnectNode = null;
       save(); draw();
     }
   });
@@ -514,9 +669,18 @@
       return;
     }
 
+    if (mode === 'platform') {
+      dragging = { type: 'newPlatform', startX: p.x, startY: p.y, cx: p.x, cy: p.y, angle: 0 };
+      draw();
+      return;
+    }
+
     if (mode === 'select') {
       const h = hitHandle(p.x, p.y);
       if (h) { dragging = { type: 'handle', ...h }; return; }
+
+      const ph = hitPlatformHandle(p.x, p.y);
+      if (ph) { dragging = { type: 'platformHandle', id: ph }; return; }
 
       const n = hitNode(p.x, p.y);
       if (n) {
@@ -529,6 +693,14 @@
       const t = hitTrack(p.x, p.y);
       if (t) {
         selected = { type: 'track', id: t.id };
+        draw();
+        return;
+      }
+
+      const plat = hitPlatform(p.x, p.y);
+      if (plat) {
+        selected = { type: 'platform', id: plat.id };
+        dragging = { type: 'platform', id: plat.id, offX: p.x - plat.x, offY: p.y - plat.y };
         draw();
         return;
       }
@@ -558,10 +730,29 @@
         t.c2locked = true;
       }
       draw();
+    } else if (dragging.type === 'platform') {
+      const p = getPlatform(dragging.id);
+      if (p) { p.x = mouse.x - dragging.offX; p.y = mouse.y - dragging.offY; draw(); }
+    } else if (dragging.type === 'platformHandle') {
+      const p = getPlatform(dragging.id);
+      if (p) { p.angle = Math.atan2(mouse.y - p.y, mouse.x - p.x); draw(); }
+    } else if (dragging.type === 'newPlatform') {
+      const dx = mouse.x - dragging.startX, dy = mouse.y - dragging.startY;
+      const dist = Math.hypot(dx, dy);
+      dragging.angle = dist > 3 ? Math.atan2(dy, dx) : 0;
+      dragging.cx = dragging.startX + Math.cos(dragging.angle) * TRAIN_LENGTH / 2;
+      dragging.cy = dragging.startY + Math.sin(dragging.angle) * TRAIN_LENGTH / 2;
+      draw();
     }
   });
 
   window.addEventListener('mouseup', () => {
+    if (dragging && dragging.type === 'newPlatform') {
+      addPlatform(dragging.cx, dragging.cy, dragging.angle);
+      dragging = null;
+      draw();
+      return;
+    }
     if (dragging) { dragging = null; save(); }
   });
 
@@ -569,6 +760,7 @@
     if ((e.key === 'Delete' || e.key === 'Backspace') && selected) {
       if (selected.type === 'node') deleteNode(selected.id);
       else if (selected.type === 'track') deleteTrack(selected.id);
+      else if (selected.type === 'platform') deletePlatform(selected.id);
       selected = null;
       draw();
     }
