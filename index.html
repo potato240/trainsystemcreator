@@ -873,6 +873,24 @@
       ctx.fill();
       ctx.restore();
     }
+
+    // alternating flashing lights on each post, lit only while barriers are
+    // active - the two sides flash out of phase, like a real crossing
+    const flashOn = Math.floor(simClock / 0.4) % 2 === 0;
+    for (const side of [-1, 1]) {
+      const lit = barrier > 0.05 && (side > 0 ? flashOn : !flashOn);
+      ctx.beginPath();
+      ctx.arc(side * (patchLen + 6), -half - 6, 3, 0, Math.PI * 2);
+      ctx.fillStyle = lit ? '#ff3b30' : '#5a2020';
+      ctx.fill();
+      if (lit) {
+        ctx.beginPath();
+        ctx.arc(side * (patchLen + 6), -half - 6, 6, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255,59,48,0.35)';
+        ctx.fill();
+      }
+    }
+
     ctx.restore();
 
     if (isSelected) {
@@ -1607,6 +1625,7 @@
 
   // ---- train animation loop ----
   let lastTick = null;
+  let simClock = 0; // seconds, drives the crossing lights' flash
   function stationList() { return facilities.filter(f => f.kind === 'station'); }
 
   function passengerSpawnPos(f) {
@@ -1757,6 +1776,7 @@
     if (lastTick != null) {
       const dt = Math.min(0.05, (ts - lastTick) / 1000);
 
+      simClock += dt;
       for (const tr of trains) tickTrain(tr, dt);
       tickCrossings(dt);
 
