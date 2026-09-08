@@ -44,6 +44,9 @@
     padding: 8px 10px;
     box-shadow: 0 4px 14px rgba(0,0,0,0.35);
     z-index: 10;
+    max-width: 92vw;
+    flex-wrap: wrap;
+    row-gap: 6px;
   }
   #toolbar .brand {
     color: var(--amber);
@@ -76,6 +79,11 @@
   }
   button.tool.danger { color: #e8734d; }
   button.tool.danger:hover { background: #4d2c22; }
+  button.tool.toggle.active {
+    background: #5cb3e8;
+    color: #0e2433;
+    border-color: #2c6f96;
+  }
 
   #hint {
     position: fixed;
@@ -116,11 +124,15 @@
     <button class="tool active" data-mode="node">Add Node</button>
     <button class="tool" data-mode="connect">Connect</button>
     <button class="tool" data-mode="station">Add Station</button>
+    <button class="tool" data-mode="depot">Add Depot</button>
+    <button class="tool" data-mode="route">Route</button>
     <button class="tool" data-mode="select">Select / Move</button>
+    <button class="tool toggle" id="doubleToggle">Double Track: Off</button>
+    <button class="tool" id="spawnBtn">Spawn Train</button>
     <button class="tool danger" id="clearBtn">Clear All</button>
   </div>
 
-  <div id="stats">Nodes: <span id="nodeCount">0</span><br>Tracks: <span id="trackCount">0</span><br>Stations: <span id="stationCount">0</span></div>
+  <div id="stats">Nodes: <span id="nodeCount">0</span><br>Tracks: <span id="trackCount">0</span><br>Facilities: <span id="facilityCount">0</span><br>Trains: <span id="trainCount">0</span></div>
 
   <div id="hint">Click empty ground to place a rail node.</div>
 
@@ -131,22 +143,26 @@
   const hint = document.getElementById('hint');
   const nodeCountEl = document.getElementById('nodeCount');
   const trackCountEl = document.getElementById('trackCount');
-  const stationCountEl = document.getElementById('stationCount');
-  const STORAGE_KEY = 'tsc_track_state_v1';
+  const facilityCountEl = document.getElementById('facilityCount');
+  const trainCountEl = document.getElementById('trainCount');
+  const STORAGE_KEY = 'tsc_track_state_v2';
 
   // Reference rolling stock: a 4-car Southeastern Class 375 "Electrostar" EMU.
-  // Each car is ~20m in real life; platforms are locked to this total length
-  // so they can never be built shorter or longer than the train itself.
+  // Each car is ~20m in real life; platforms/depots are locked to this total
+  // length so they can never be built shorter or longer than the train itself.
   const TRAIN_CARS = 4;
   const CAR_LENGTH = 42;
   const TRAIN_LENGTH = CAR_LENGTH * TRAIN_CARS;
   const TRAIN_WIDTH = 22;
   const PLATFORM_WIDTH = 32;
   const PLATFORM_GAP = 6;
-  // The train runs along the station track's own centerline; the platform
+  // The train runs along the facility track's own centerline; the platform
   // sits beside it, offset perpendicular by half the train, the gap, and
   // half the platform - never on top of the rails themselves.
   const PLATFORM_OFFSET = TRAIN_WIDTH / 2 + PLATFORM_GAP + PLATFORM_WIDTH / 2;
+  // Separation between the two lanes of a double track.
+  const DOUBLE_GAP = 22;
+  const TRAIN_SPEED = 70; // px/s
 
   function resize() {
     canvas.width = window.innerWidth * devicePixelRatio;
@@ -159,24 +175,27 @@
   window.addEventListener('resize', resize);
 
   // ---- state ----
-  let nodes = [];       // {id, x, y}
-  let tracks = [];      // {id, aId, bId, c1off:{x,y}, c2off:{x,y}}
-  let stations = [];    // {id, x, y, angle, nodeId, farNodeId, trackId} - length is always TRAIN_LENGTH
+  let nodes = [];       // {id, x, y, double}
+  let tracks = [];      // {id, aId, bId, c1off, c2off, c1locked, c2locked, double}
+  let facilities = [];  // {id, kind:'station'|'depot', x, y, angle, nodeId, farNodeId, trackId, double}
+  let trains = [];      // {id, depotId, path:[nodeId...], pts, cum, total, pos, dir, speed}
   let nextId = 1;
 
   let mode = 'node';
+  let doubleTrack = false;
   let pendingConnectNode = null;
-  let selected = null; // {type:'node'|'track'|'station', id}
-  let dragging = null; // {type:'node'|'station', id} | {type:'handle', trackId, which} | {type:'stationHandle', id} | {type:'newStation', nodeId, startX, startY, angle}
+  let pendingRoute = null; // {depotId, path:[nodeId...]}
+  let selected = null; // {type:'node'|'track'|'facility', id}
+  let dragging = null;
   let mouse = { x: 0, y: 0 };
 
   function uid() { return nextId++; }
   function getNode(id) { return nodes.find(n => n.id === id); }
   function getTrack(id) { return tracks.find(t => t.id === id); }
-  function getStation(id) { return stations.find(s => s.id === id); }
+  function getFacility(id) { return facilities.find(f => f.id === id); }
 
   function save() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, tracks, stations, nextId }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, tracks, facilities, trains, nextId }));
   }
   function load() {
     try {
@@ -186,14 +205,17 @@
       if (data.nodes && data.tracks) {
         nodes = data.nodes;
         tracks = data.tracks;
-        stations = data.stations || [];
-        nextId = data.nextId || (Math.max(0, ...nodes.map(n=>n.id), ...tracks.map(t=>t.id), ...stations.map(s=>s.id)) + 1);
+        facilities = data.facilities || [];
+        trains = data.trains || [];
+        nextId = data.nextId || (Math.max(0,
+          ...nodes.map(n => n.id), ...tracks.map(t => t.id),
+          ...facilities.map(f => f.id), ...trains.map(t => t.id)) + 1);
       }
     } catch (e) { /* ignore corrupt state */ }
   }
 
   function addNode(x, y) {
-    const n = { id: uid(), x, y };
+    const n = { id: uid(), x, y, double: doubleTrack };
     nodes.push(n);
     save();
     return n;
@@ -211,6 +233,7 @@
       c2off: { x: -dx, y: -dy },
       c1locked: false,
       c2locked: false,
+      double: doubleTrack,
     };
     tracks.push(track);
     recomputeAutoTangents();
@@ -218,29 +241,39 @@
     return track;
   }
 
+  function trackBetween(aId, bId) {
+    return tracks.find(t => (t.aId === aId && t.bId === bId) || (t.aId === bId && t.bId === aId));
+  }
+
   function deleteNode(id) {
     nodes = nodes.filter(n => n.id !== id);
     tracks = tracks.filter(t => t.aId !== id && t.bId !== id);
-    stations = stations.filter(s => s.nodeId !== id && s.farNodeId !== id);
+    facilities = facilities.filter(f => f.nodeId !== id && f.farNodeId !== id);
+    pruneInvalidTrains();
     recomputeAutoTangents();
     save();
   }
   function deleteTrack(id) {
     tracks = tracks.filter(t => t.id !== id);
-    stations = stations.filter(s => s.trackId !== id);
+    facilities = facilities.filter(f => f.trackId !== id);
+    pruneInvalidTrains();
     recomputeAutoTangents();
     save();
   }
 
-  // A station is a platform locked to exactly TRAIN_LENGTH, built by dragging
-  // out from an existing rail node - only position/angle are adjustable, and
-  // it always comes with its own connecting track running the full length.
-  function addStation(x, y, angle, nodeId, farNodeId, trackId) {
-    stations.push({ id: uid(), x, y, angle, nodeId, farNodeId, trackId });
+  // A facility (station or depot) is a platform/shed locked to exactly
+  // TRAIN_LENGTH, built by dragging out from an existing rail node - only
+  // position/angle are adjustable, and it always comes with its own
+  // connecting track running the full length. Depots are where trains spawn.
+  function addFacility(kind, x, y, angle, nodeId, farNodeId, trackId) {
+    const f = { id: uid(), kind, x, y, angle, nodeId, farNodeId, trackId, double: doubleTrack };
+    facilities.push(f);
     save();
+    return f;
   }
-  function deleteStation(id) {
-    stations = stations.filter(s => s.id !== id);
+  function deleteFacility(id) {
+    facilities = facilities.filter(f => f.id !== id);
+    trains = trains.filter(t => t.depotId !== id);
     save();
   }
 
@@ -296,6 +329,86 @@
     }
   }
 
+  // ---- routing (for trains) ----
+  function shortestPath(startId, endId) {
+    if (startId === endId) return [startId];
+    const visited = new Set([startId]);
+    const prev = {};
+    const queue = [startId];
+    while (queue.length) {
+      const cur = queue.shift();
+      if (cur === endId) break;
+      for (const nb of nodeNeighbors(cur)) {
+        if (!visited.has(nb.otherId)) {
+          visited.add(nb.otherId);
+          prev[nb.otherId] = cur;
+          queue.push(nb.otherId);
+        }
+      }
+    }
+    if (!visited.has(endId)) return null;
+    const path = [endId];
+    let cur = endId;
+    while (cur !== startId) { cur = prev[cur]; path.push(cur); }
+    path.reverse();
+    return path;
+  }
+
+  function buildRouteGeometry(path) {
+    let pts = [];
+    for (let i = 0; i < path.length - 1; i++) {
+      const track = trackBetween(path[i], path[i + 1]);
+      if (!track) return null;
+      let segPts = trackPoints(track, 24);
+      const startNode = getNode(path[i]);
+      if (Math.hypot(segPts[0].x - startNode.x, segPts[0].y - startNode.y) > 1) {
+        segPts = segPts.slice().reverse();
+      }
+      if (pts.length > 0) segPts = segPts.slice(1);
+      pts = pts.concat(segPts);
+    }
+    if (pts.length < 2) return null;
+    const cum = [0];
+    for (let i = 1; i < pts.length; i++) {
+      cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+    }
+    return { pts, cum, total: cum[cum.length - 1] };
+  }
+
+  function spawnTrain(depotId, path) {
+    const geo = buildRouteGeometry(path);
+    if (!geo) return null;
+    const train = { id: uid(), depotId, path, pts: geo.pts, cum: geo.cum, total: geo.total, pos: 0, dir: 1, speed: TRAIN_SPEED };
+    trains.push(train);
+    save();
+    return train;
+  }
+
+  function pruneInvalidTrains() {
+    trains = trains.filter(tr => {
+      if (!getNode(tr.path[0])) return false;
+      for (let i = 0; i < tr.path.length - 1; i++) {
+        if (!trackBetween(tr.path[i], tr.path[i + 1])) return false;
+      }
+      return true;
+    });
+  }
+
+  function trainPoseAt(train, distAlong) {
+    const { pts, cum, total } = train;
+    const d = Math.max(0, Math.min(total, distAlong));
+    let i = 1;
+    while (i < cum.length - 1 && cum[i] < d) i++;
+    const segLen = cum[i] - cum[i - 1] || 1;
+    const t = (d - cum[i - 1]) / segLen;
+    const p0 = pts[i - 1], p1 = pts[i];
+    return {
+      x: p0.x + (p1.x - p0.x) * t,
+      y: p0.y + (p1.y - p0.y) * t,
+      angle: Math.atan2(p1.y - p0.y, p1.x - p0.x),
+    };
+  }
+
   // ---- geometry helpers ----
   function bezierPt(t, p0, p1, p2, p3) {
     const mt = 1 - t;
@@ -314,6 +427,19 @@
     const pts = [];
     for (let i = 0; i <= n; i++) pts.push(bezierPt(i / n, a, c1, c2, b));
     return pts;
+  }
+
+  function offsetPolyline(pts, dist) {
+    const out = [];
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      const prev = pts[i - 1] || p, next = pts[i + 1] || p;
+      const dx = next.x - prev.x, dy = next.y - prev.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const nx = -dy / len, ny = dx / len;
+      out.push({ x: p.x + nx * dist, y: p.y + ny * dist });
+    }
+    return out;
   }
 
   function handlePositions(track) {
@@ -363,40 +489,46 @@
     return best;
   }
 
-  // Platform's own center, offset to one side of the track the station is built on.
-  function platformCenter(s) {
+  // Platform/shed center for one side of a facility ('side' is +1 or -1);
+  // doubled facilities push the offset out past the second rail lane.
+  function facilityPlatformCenter(f, side) {
+    const extra = f.double ? DOUBLE_GAP / 2 : 0;
+    const offset = (PLATFORM_OFFSET + extra) * side;
     return {
-      x: s.x - Math.sin(s.angle) * PLATFORM_OFFSET,
-      y: s.y + Math.cos(s.angle) * PLATFORM_OFFSET,
+      x: f.x - Math.sin(f.angle) * offset,
+      y: f.y + Math.cos(f.angle) * offset,
     };
   }
 
-  function hitStation(x, y) {
-    for (let i = stations.length - 1; i >= 0; i--) {
-      const s = stations[i];
-      const c = platformCenter(s);
-      const dx = x - c.x, dy = y - c.y;
-      const cos = Math.cos(-s.angle), sin = Math.sin(-s.angle);
-      const lx = dx * cos - dy * sin, ly = dx * sin + dy * cos;
-      if (Math.abs(lx) <= TRAIN_LENGTH / 2 && Math.abs(ly) <= PLATFORM_WIDTH / 2) return s;
+  function hitFacility(x, y) {
+    for (let i = facilities.length - 1; i >= 0; i--) {
+      const f = facilities[i];
+      const sides = f.double ? [1, -1] : [1];
+      for (const side of sides) {
+        const c = facilityPlatformCenter(f, side);
+        const dx = x - c.x, dy = y - c.y;
+        const cos = Math.cos(-f.angle), sin = Math.sin(-f.angle);
+        const lx = dx * cos - dy * sin, ly = dx * sin + dy * cos;
+        if (Math.abs(lx) <= TRAIN_LENGTH / 2 && Math.abs(ly) <= PLATFORM_WIDTH / 2) return f;
+      }
     }
     return null;
   }
 
-  function stationHandlePos(s) {
-    const c = platformCenter(s);
+  function facilityHandlePos(f) {
+    const c = facilityPlatformCenter(f, 1);
     return {
-      x: c.x + Math.cos(s.angle) * (TRAIN_LENGTH / 2 + 16),
-      y: c.y + Math.sin(s.angle) * (TRAIN_LENGTH / 2 + 16),
+      x: c.x + Math.cos(f.angle) * (TRAIN_LENGTH / 2 + 16),
+      y: c.y + Math.sin(f.angle) * (TRAIN_LENGTH / 2 + 16),
     };
   }
 
-  function hitStationHandle(x, y) {
-    if (!selected || selected.type !== 'station') return null;
-    const s = getStation(selected.id);
-    if (!s) return null;
-    const h = stationHandlePos(s);
-    return Math.hypot(h.x - x, h.y - y) <= 8 ? s.id : null;
+  function hitFacilityHandle(x, y) {
+    if (!selected || selected.type !== 'facility') return null;
+    const f = getFacility(selected.id);
+    if (!f) return null;
+    const h = facilityHandlePos(f);
+    return Math.hypot(h.x - x, h.y - y) <= 8 ? f.id : null;
   }
 
   // ---- rendering ----
@@ -414,8 +546,7 @@
     }
   }
 
-  function drawTrack(track, isSelected) {
-    const pts = trackPoints(track, 48);
+  function drawTrackLane(pts, isSelected) {
     if (pts.length < 2) return;
 
     // ballast
@@ -467,6 +598,18 @@
       ctx.lineWidth = 2.2;
       ctx.stroke();
     }
+  }
+
+  function drawTrack(track, isSelected) {
+    const pts = trackPoints(track, 48);
+    if (pts.length < 2) return;
+
+    if (track.double) {
+      drawTrackLane(offsetPolyline(pts, DOUBLE_GAP / 2), isSelected);
+      drawTrackLane(offsetPolyline(pts, -DOUBLE_GAP / 2), isSelected);
+    } else {
+      drawTrackLane(pts, isSelected);
+    }
 
     if (isSelected) {
       const h = handlePositions(track);
@@ -487,32 +630,60 @@
     }
   }
 
-  function drawStationPlatform(s, isSelected) {
-    ctx.save();
-    ctx.translate(s.x, s.y);
-    ctx.rotate(s.angle);
-    ctx.translate(0, PLATFORM_OFFSET);
+  function drawFacility(f, isSelected) {
+    const sides = f.double ? [1, -1] : [1];
+    const offsetExtra = f.double ? DOUBLE_GAP / 2 : 0;
 
-    ctx.beginPath();
-    ctx.roundRect(-TRAIN_LENGTH / 2, -PLATFORM_WIDTH / 2, TRAIN_LENGTH, PLATFORM_WIDTH, 4);
-    ctx.fillStyle = isSelected ? '#cdc6b2' : '#b5ae9c';
-    ctx.fill();
-    ctx.strokeStyle = '#5a5548';
-    ctx.lineWidth = 2;
-    ctx.stroke();
+    for (const side of sides) {
+      ctx.save();
+      ctx.translate(f.x, f.y);
+      ctx.rotate(f.angle);
+      ctx.translate(0, (PLATFORM_OFFSET + offsetExtra) * side);
 
-    // trackside tactile edge strip
-    ctx.fillStyle = '#e8c93d';
-    ctx.fillRect(-TRAIN_LENGTH / 2 + 4, PLATFORM_WIDTH / 2 - 6, TRAIN_LENGTH - 8, 4);
+      ctx.beginPath();
+      ctx.roundRect(-TRAIN_LENGTH / 2, -PLATFORM_WIDTH / 2, TRAIN_LENGTH, PLATFORM_WIDTH, 4);
 
-    ctx.restore();
+      if (f.kind === 'depot') {
+        ctx.fillStyle = isSelected ? '#8a5a48' : '#6b4534';
+        ctx.fill();
+        ctx.strokeStyle = '#3a251a';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // corrugated shed roof lines
+        ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+        ctx.lineWidth = 1;
+        for (let rx = -TRAIN_LENGTH / 2 + 8; rx < TRAIN_LENGTH / 2 - 8; rx += 10) {
+          ctx.beginPath();
+          ctx.moveTo(rx, -PLATFORM_WIDTH / 2 + 4);
+          ctx.lineTo(rx, PLATFORM_WIDTH / 2 - 4);
+          ctx.stroke();
+        }
+
+        // roller door
+        ctx.fillStyle = '#e8c93d';
+        ctx.fillRect(TRAIN_LENGTH / 2 - 14, -PLATFORM_WIDTH / 2 + 4, 10, PLATFORM_WIDTH - 8);
+      } else {
+        ctx.fillStyle = isSelected ? '#cdc6b2' : '#b5ae9c';
+        ctx.fill();
+        ctx.strokeStyle = '#5a5548';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // trackside tactile edge strip
+        ctx.fillStyle = '#e8c93d';
+        ctx.fillRect(-TRAIN_LENGTH / 2 + 4, PLATFORM_WIDTH / 2 - 6, TRAIN_LENGTH - 8, 4);
+      }
+
+      ctx.restore();
+    }
 
     if (isSelected) {
-      const h = stationHandlePos(s);
+      const h = facilityHandlePos(f);
       ctx.strokeStyle = 'rgba(255,255,255,0.5)';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
-      ctx.moveTo(s.x, s.y);
+      ctx.moveTo(f.x, f.y);
       ctx.lineTo(h.x, h.y);
       ctx.stroke();
       ctx.beginPath();
@@ -525,117 +696,180 @@
     }
   }
 
-  // 4-car Class 375 "Electrostar" in Southeastern livery, drawn as seen
-  // from directly above: roof panels, aircon units, door tick-marks and a
-  // folded pantograph, rather than a side elevation flattened onto the plan.
-  function drawTrain(s) {
-    ctx.save();
-    ctx.translate(s.x, s.y);
-    ctx.rotate(s.angle);
+  // 4-car Class 375 "Electrostar" in Southeastern livery, drawn as seen from
+  // directly above. The train is articulated: each car is posed and rotated
+  // independently along a `sampler(offset)` function that returns {x,y,angle}
+  // for a signed distance from the train's own center - so on a curved route
+  // each car bends to follow the track instead of the whole unit staying rigid.
+  function makeStraightSampler(p) {
+    return (offset) => ({
+      x: p.x + Math.cos(p.angle) * offset,
+      y: p.y + Math.sin(p.angle) * offset,
+      angle: p.angle,
+    });
+  }
 
-    // roof
+  function makeRouteSampler(train) {
+    return (offset) => trainPoseAt(train, train.pos + offset);
+  }
+
+  function drawCar(isFirstCar, isLastCar) {
+    // roof, assumes already translated/rotated to the car's own center
     ctx.beginPath();
-    ctx.roundRect(-TRAIN_LENGTH / 2, -TRAIN_WIDTH / 2, TRAIN_LENGTH, TRAIN_WIDTH, 8);
+    ctx.roundRect(-CAR_LENGTH / 2, -TRAIN_WIDTH / 2, CAR_LENGTH, TRAIN_WIDTH, 6);
     ctx.fillStyle = '#d7dbda';
     ctx.fill();
     ctx.strokeStyle = '#23262a';
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    // Southeastern livery edge stripes (bodyside relief visible past the roof overhang)
+    // Southeastern livery edge stripes
     ctx.strokeStyle = '#1d4f91';
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.moveTo(-TRAIN_LENGTH / 2 + 6, -TRAIN_WIDTH / 2 + 2);
-    ctx.lineTo(TRAIN_LENGTH / 2 - 6, -TRAIN_WIDTH / 2 + 2);
-    ctx.moveTo(-TRAIN_LENGTH / 2 + 6, TRAIN_WIDTH / 2 - 2);
-    ctx.lineTo(TRAIN_LENGTH / 2 - 6, TRAIN_WIDTH / 2 - 2);
+    ctx.moveTo(-CAR_LENGTH / 2 + 3, -TRAIN_WIDTH / 2 + 2);
+    ctx.lineTo(CAR_LENGTH / 2 - 3, -TRAIN_WIDTH / 2 + 2);
+    ctx.moveTo(-CAR_LENGTH / 2 + 3, TRAIN_WIDTH / 2 - 2);
+    ctx.lineTo(CAR_LENGTH / 2 - 3, TRAIN_WIDTH / 2 - 2);
     ctx.stroke();
 
-    // roof walkway ridge
-    ctx.strokeStyle = '#b7bcbb';
-    ctx.lineWidth = 1;
+    // roof-mounted aircon unit
     ctx.beginPath();
-    ctx.moveTo(-TRAIN_LENGTH / 2 + 8, 0);
-    ctx.lineTo(TRAIN_LENGTH / 2 - 8, 0);
+    ctx.roundRect(-9, -TRAIN_WIDTH * 0.22, 18, TRAIN_WIDTH * 0.44, 2);
+    ctx.fillStyle = '#aeb3b2';
+    ctx.fill();
+    ctx.strokeStyle = '#7d8180';
+    ctx.lineWidth = 1;
     ctx.stroke();
 
-    for (let i = 0; i < TRAIN_CARS; i++) {
-      const carStart = -TRAIN_LENGTH / 2 + i * CAR_LENGTH;
-      const carMid = carStart + CAR_LENGTH / 2;
-
-      // roof-mounted aircon unit
+    // door tick-marks, two per side
+    ctx.strokeStyle = '#5a5e5d';
+    ctx.lineWidth = 1.5;
+    for (const frac of [-0.22, 0.22]) {
+      const dx = frac * CAR_LENGTH;
       ctx.beginPath();
-      ctx.roundRect(carMid - 9, -TRAIN_WIDTH * 0.22, 18, TRAIN_WIDTH * 0.44, 2);
-      ctx.fillStyle = '#aeb3b2';
-      ctx.fill();
-      ctx.strokeStyle = '#7d8180';
-      ctx.lineWidth = 1;
+      ctx.moveTo(dx, -TRAIN_WIDTH / 2);
+      ctx.lineTo(dx, -TRAIN_WIDTH / 2 + 4);
+      ctx.moveTo(dx, TRAIN_WIDTH / 2);
+      ctx.lineTo(dx, TRAIN_WIDTH / 2 - 4);
       ctx.stroke();
-
-      // door tick-marks, two per side per car
-      ctx.strokeStyle = '#5a5e5d';
-      ctx.lineWidth = 1.5;
-      for (const frac of [0.28, 0.72]) {
-        const dx = carStart + CAR_LENGTH * frac;
-        ctx.beginPath();
-        ctx.moveTo(dx, -TRAIN_WIDTH / 2);
-        ctx.lineTo(dx, -TRAIN_WIDTH / 2 + 4);
-        ctx.moveTo(dx, TRAIN_WIDTH / 2);
-        ctx.lineTo(dx, TRAIN_WIDTH / 2 - 4);
-        ctx.stroke();
-      }
-
-      // gangway / coupler gap between cars
-      if (i > 0) {
-        ctx.strokeStyle = '#3a3d3c';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(carStart, -TRAIN_WIDTH / 2 + 3);
-        ctx.lineTo(carStart, TRAIN_WIDTH / 2 - 3);
-        ctx.stroke();
-      }
     }
 
-    // yellow warning panels at each cab end
-    ctx.fillStyle = '#e8c93d';
-    ctx.fillRect(-TRAIN_LENGTH / 2, -TRAIN_WIDTH / 2 + 2, 5, TRAIN_WIDTH - 4);
-    ctx.fillRect(TRAIN_LENGTH / 2 - 5, -TRAIN_WIDTH / 2 + 2, 5, TRAIN_WIDTH - 4);
+    // yellow warning panel, only on the train's true leading/trailing ends
+    if (isFirstCar || isLastCar) {
+      ctx.fillStyle = '#e8c93d';
+      const ex = isFirstCar ? -CAR_LENGTH / 2 : CAR_LENGTH / 2 - 5;
+      ctx.fillRect(ex, -TRAIN_WIDTH / 2 + 2, 5, TRAIN_WIDTH - 4);
+    }
+  }
 
-    // folded pantograph on car 2, seen from above
-    const panX = -TRAIN_LENGTH / 2 + CAR_LENGTH * 1.5;
-    ctx.strokeStyle = '#333';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(panX, -6);
-    ctx.lineTo(panX - 4, 0);
-    ctx.lineTo(panX, 6);
-    ctx.lineTo(panX + 4, 0);
-    ctx.closePath();
-    ctx.stroke();
+  function drawArticulatedTrain(sampler) {
+    for (let i = 0; i < TRAIN_CARS; i++) {
+      const centerOffset = -TRAIN_LENGTH / 2 + i * CAR_LENGTH + CAR_LENGTH / 2;
+      const pose = sampler(centerOffset);
+      ctx.save();
+      ctx.translate(pose.x, pose.y);
+      ctx.rotate(pose.angle);
+      drawCar(i === 0, i === TRAIN_CARS - 1);
+      if (i === 1) {
+        // folded pantograph on car 2, seen from above
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(0, -6);
+        ctx.lineTo(-4, 0);
+        ctx.lineTo(0, 6);
+        ctx.lineTo(4, 0);
+        ctx.closePath();
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
 
-    ctx.restore();
+    // articulated couplers between cars, each following the curve at its own joint
+    ctx.strokeStyle = '#3a3d3c';
+    ctx.lineWidth = 2.5;
+    for (let i = 1; i < TRAIN_CARS; i++) {
+      const jointOffset = -TRAIN_LENGTH / 2 + i * CAR_LENGTH;
+      const pose = sampler(jointOffset);
+      const nx = -Math.sin(pose.angle), ny = Math.cos(pose.angle);
+      const half = TRAIN_WIDTH / 2 - 3;
+      ctx.beginPath();
+      ctx.moveTo(pose.x - nx * half, pose.y - ny * half);
+      ctx.lineTo(pose.x + nx * half, pose.y + ny * half);
+      ctx.stroke();
+    }
+  }
+
+  function drawFacilityTrains(f) {
+    const sides = f.double ? [1, -1] : [1];
+    for (const side of sides) {
+      const laneOffset = f.double ? side * DOUBLE_GAP / 2 : 0;
+      drawArticulatedTrain(makeStraightSampler({
+        x: f.x - Math.sin(f.angle) * laneOffset,
+        y: f.y + Math.cos(f.angle) * laneOffset,
+        angle: f.angle,
+      }));
+    }
   }
 
   function drawNode(node, isSelected, isPending) {
+    const r = node.double ? 11 : 9;
+
     // shadow pad
     ctx.beginPath();
-    ctx.ellipse(node.x, node.y + 2, 12, 9, 0, 0, Math.PI * 2);
+    ctx.ellipse(node.x, node.y + 2, r * 1.3, r, 0, 0, Math.PI * 2);
     ctx.fillStyle = 'rgba(0,0,0,0.22)';
     ctx.fill();
 
     ctx.beginPath();
-    ctx.arc(node.x, node.y, 9, 0, Math.PI * 2);
+    ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
     ctx.fillStyle = isPending ? '#5cb3e8' : (isSelected ? '#ffd27a' : '#e8a33d');
     ctx.fill();
     ctx.strokeStyle = '#3a2410';
     ctx.lineWidth = 2.5;
     ctx.stroke();
 
+    if (node.double) {
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, r - 4, 0, Math.PI * 2);
+      ctx.strokeStyle = '#3a2410';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, 3, 0, Math.PI * 2);
+      ctx.fillStyle = '#3a2410';
+      ctx.fill();
+    }
+  }
+
+  function drawPendingRoute() {
+    if (!pendingRoute || pendingRoute.path.length < 1) return;
+    ctx.strokeStyle = '#5cb3e8';
+    ctx.lineWidth = 4;
+    ctx.setLineDash([8, 6]);
     ctx.beginPath();
-    ctx.arc(node.x, node.y, 3, 0, Math.PI * 2);
-    ctx.fillStyle = '#3a2410';
-    ctx.fill();
+    for (let i = 0; i < pendingRoute.path.length - 1; i++) {
+      const track = trackBetween(pendingRoute.path[i], pendingRoute.path[i + 1]);
+      if (!track) continue;
+      const pts = trackPoints(track, 24);
+      const startNode = getNode(pendingRoute.path[i]);
+      const ordered = Math.hypot(pts[0].x - startNode.x, pts[0].y - startNode.y) > 1 ? pts.slice().reverse() : pts;
+      ctx.moveTo(ordered[0].x, ordered[0].y);
+      for (const p of ordered) ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const lastId = pendingRoute.path[pendingRoute.path.length - 1];
+    const last = getNode(lastId);
+    if (last) {
+      ctx.beginPath();
+      ctx.arc(last.x, last.y, 13, 0, Math.PI * 2);
+      ctx.strokeStyle = '#5cb3e8';
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
   }
 
   function draw() {
@@ -645,32 +879,39 @@
     for (const t of tracks) {
       drawTrack(t, selected && selected.type === 'track' && selected.id === t.id);
     }
-    for (const s of stations) {
-      const isSelected = selected && selected.type === 'station' && selected.id === s.id;
-      drawStationPlatform(s, isSelected);
-      drawTrain(s);
+    for (const f of facilities) {
+      const isSelected = selected && selected.type === 'facility' && selected.id === f.id;
+      drawFacility(f, isSelected);
+      drawFacilityTrains(f);
     }
     for (const n of nodes) {
       const isSelected = selected && selected.type === 'node' && selected.id === n.id;
       const isPending = pendingConnectNode === n.id;
       drawNode(n, isSelected, isPending);
     }
+    for (const tr of trains) {
+      drawArticulatedTrain(makeRouteSampler(tr));
+    }
 
-    if (dragging && dragging.type === 'newStation') {
+    drawPendingRoute();
+
+    if (dragging && dragging.type === 'newFacility') {
       ctx.globalAlpha = 0.55;
-      drawStationPlatform({ x: dragging.cx, y: dragging.cy, angle: dragging.angle }, false);
+      drawFacility({ x: dragging.cx, y: dragging.cy, angle: dragging.angle, kind: dragging.kind, double: doubleTrack }, false);
       ctx.globalAlpha = 1;
     }
 
     nodeCountEl.textContent = nodes.length;
     trackCountEl.textContent = tracks.length;
-    stationCountEl.textContent = stations.length;
+    facilityCountEl.textContent = facilities.length;
+    trainCountEl.textContent = trains.length;
   }
 
   // ---- interaction ----
   function setMode(m) {
     mode = m;
     pendingConnectNode = null;
+    if (m !== 'route') pendingRoute = null;
     selected = null;
     document.querySelectorAll('button.tool[data-mode]').forEach(b => {
       b.classList.toggle('active', b.dataset.mode === m);
@@ -685,16 +926,40 @@
       ? 'Now click a second node to lay track between them.'
       : 'Click a node to start a connection.';
     else if (mode === 'station') hint.textContent = 'Click and drag from an existing rail node to build a station - it lays its own track and a platform locked to the train\'s length; drag just sets the angle.';
-    else if (mode === 'select') hint.textContent = 'Drag nodes or stations to move them. Click a track to bend it, or a station to rotate it (drag blue handles). Press Delete to remove selection.';
+    else if (mode === 'depot') hint.textContent = 'Click and drag from an existing rail node to build a depot - a shed where trains spawn.';
+    else if (mode === 'route') hint.textContent = pendingRoute
+      ? `Route has ${pendingRoute.path.length} stop(s) - click more nodes to extend it, or press Spawn Train. Esc to cancel.`
+      : 'Click a depot\'s track node to start a route.';
+    else if (mode === 'select') hint.textContent = 'Drag nodes or facilities to move them. Click a track to bend it, or a facility to rotate it (drag blue handles). Press Delete to remove selection.';
   }
 
   document.querySelectorAll('button.tool[data-mode]').forEach(b => {
     b.addEventListener('click', () => setMode(b.dataset.mode));
   });
+
+  const doubleToggleBtn = document.getElementById('doubleToggle');
+  doubleToggleBtn.addEventListener('click', () => {
+    doubleTrack = !doubleTrack;
+    doubleToggleBtn.textContent = 'Double Track: ' + (doubleTrack ? 'On' : 'Off');
+    doubleToggleBtn.classList.toggle('active', doubleTrack);
+  });
+
+  document.getElementById('spawnBtn').addEventListener('click', () => {
+    if (!pendingRoute || pendingRoute.path.length < 2) {
+      hint.textContent = 'Build a route first: switch to Route mode, click a depot\'s node, then more nodes.';
+      return;
+    }
+    spawnTrain(pendingRoute.depotId, pendingRoute.path);
+    pendingRoute = null;
+    updateHint();
+    draw();
+  });
+
   document.getElementById('clearBtn').addEventListener('click', () => {
-    if (nodes.length === 0 && tracks.length === 0 && stations.length === 0) return;
+    if (nodes.length === 0 && tracks.length === 0 && facilities.length === 0 && trains.length === 0) return;
     if (confirm('Clear the entire track layout?')) {
-      nodes = []; tracks = []; stations = []; selected = null; pendingConnectNode = null;
+      nodes = []; tracks = []; facilities = []; trains = [];
+      selected = null; pendingConnectNode = null; pendingRoute = null;
       save(); draw();
     }
   });
@@ -729,10 +994,30 @@
       return;
     }
 
-    if (mode === 'station') {
+    if (mode === 'station' || mode === 'depot') {
       const n = hitNode(p.x, p.y);
-      if (!n) { hint.textContent = 'Start the drag on an existing rail node to anchor the station.'; return; }
-      dragging = { type: 'newStation', nodeId: n.id, startX: n.x, startY: n.y, cx: n.x, cy: n.y, angle: 0 };
+      if (!n) { hint.textContent = 'Start the drag on an existing rail node to anchor it.'; return; }
+      dragging = { type: 'newFacility', kind: mode, nodeId: n.id, startX: n.x, startY: n.y, cx: n.x, cy: n.y, angle: 0 };
+      draw();
+      return;
+    }
+
+    if (mode === 'route') {
+      const n = hitNode(p.x, p.y);
+      if (!n) return;
+      if (!pendingRoute) {
+        const dep = facilities.find(f => f.kind === 'depot' && (f.nodeId === n.id || f.farNodeId === n.id));
+        if (!dep) { hint.textContent = 'Start a route by clicking a depot\'s track node.'; draw(); return; }
+        pendingRoute = { depotId: dep.id, path: [n.id] };
+      } else {
+        const last = pendingRoute.path[pendingRoute.path.length - 1];
+        if (n.id !== last) {
+          const seg = shortestPath(last, n.id);
+          if (!seg) { hint.textContent = 'No track connects to that node yet.'; draw(); return; }
+          pendingRoute.path = pendingRoute.path.concat(seg.slice(1));
+        }
+      }
+      updateHint();
       draw();
       return;
     }
@@ -741,8 +1026,8 @@
       const h = hitHandle(p.x, p.y);
       if (h) { dragging = { type: 'handle', ...h }; return; }
 
-      const sh = hitStationHandle(p.x, p.y);
-      if (sh) { dragging = { type: 'stationHandle', id: sh }; return; }
+      const fh = hitFacilityHandle(p.x, p.y);
+      if (fh) { dragging = { type: 'facilityHandle', id: fh }; return; }
 
       const n = hitNode(p.x, p.y);
       if (n) {
@@ -759,10 +1044,10 @@
         return;
       }
 
-      const st = hitStation(p.x, p.y);
-      if (st) {
-        selected = { type: 'station', id: st.id };
-        dragging = { type: 'station', id: st.id, offX: p.x - st.x, offY: p.y - st.y };
+      const f = hitFacility(p.x, p.y);
+      if (f) {
+        selected = { type: 'facility', id: f.id };
+        dragging = { type: 'facility', id: f.id, offX: p.x - f.x, offY: p.y - f.y };
         draw();
         return;
       }
@@ -792,13 +1077,13 @@
         t.c2locked = true;
       }
       draw();
-    } else if (dragging.type === 'station') {
-      const s = getStation(dragging.id);
-      if (s) { s.x = mouse.x - dragging.offX; s.y = mouse.y - dragging.offY; draw(); }
-    } else if (dragging.type === 'stationHandle') {
-      const s = getStation(dragging.id);
-      if (s) { s.angle = Math.atan2(mouse.y - s.y, mouse.x - s.x); draw(); }
-    } else if (dragging.type === 'newStation') {
+    } else if (dragging.type === 'facility') {
+      const f = getFacility(dragging.id);
+      if (f) { f.x = mouse.x - dragging.offX; f.y = mouse.y - dragging.offY; draw(); }
+    } else if (dragging.type === 'facilityHandle') {
+      const f = getFacility(dragging.id);
+      if (f) { f.angle = Math.atan2(mouse.y - f.y, mouse.x - f.x); draw(); }
+    } else if (dragging.type === 'newFacility') {
       const dx = mouse.x - dragging.startX, dy = mouse.y - dragging.startY;
       const dist = Math.hypot(dx, dy);
       dragging.angle = dist > 3 ? Math.atan2(dy, dx) : 0;
@@ -809,13 +1094,13 @@
   });
 
   window.addEventListener('mouseup', () => {
-    if (dragging && dragging.type === 'newStation') {
+    if (dragging && dragging.type === 'newFacility') {
       const anchor = getNode(dragging.nodeId);
       const farX = dragging.startX + Math.cos(dragging.angle) * TRAIN_LENGTH;
       const farY = dragging.startY + Math.sin(dragging.angle) * TRAIN_LENGTH;
       const farNode = addNode(farX, farY);
       const track = addTrack(anchor.id, farNode.id);
-      // keep the station's own track dead straight so the platform never
+      // keep the facility's own track dead straight so the platform never
       // drifts out of alignment with it, even if auto-tangent smoothing
       // later bends other tracks meeting at the anchor node
       const dx = (farNode.x - anchor.x) / 3, dy = (farNode.y - anchor.y) / 3;
@@ -823,7 +1108,8 @@
       track.c2off = { x: -dx, y: -dy };
       track.c1locked = true;
       track.c2locked = true;
-      addStation(dragging.cx, dragging.cy, dragging.angle, anchor.id, farNode.id, track.id);
+      track.double = doubleTrack;
+      addFacility(dragging.kind, dragging.cx, dragging.cy, dragging.angle, anchor.id, farNode.id, track.id);
       dragging = null;
       save();
       draw();
@@ -836,16 +1122,39 @@
     if ((e.key === 'Delete' || e.key === 'Backspace') && selected) {
       if (selected.type === 'node') deleteNode(selected.id);
       else if (selected.type === 'track') deleteTrack(selected.id);
-      else if (selected.type === 'station') deleteStation(selected.id);
+      else if (selected.type === 'facility') deleteFacility(selected.id);
       selected = null;
+      draw();
+    } else if (e.key === 'Escape' && pendingRoute) {
+      pendingRoute = null;
+      updateHint();
       draw();
     }
   });
+
+  // ---- train animation loop ----
+  let lastTick = null;
+  function animate(ts) {
+    if (lastTick != null) {
+      const dt = Math.min(0.05, (ts - lastTick) / 1000);
+      if (trains.length > 0) {
+        for (const tr of trains) {
+          tr.pos += tr.speed * tr.dir * dt;
+          if (tr.pos >= tr.total) { tr.pos = tr.total; tr.dir = -1; }
+          else if (tr.pos <= 0) { tr.pos = 0; tr.dir = 1; }
+        }
+        draw();
+      }
+    }
+    lastTick = ts;
+    requestAnimationFrame(animate);
+  }
 
   load();
   recomputeAutoTangents();
   resize();
   setMode('node');
+  requestAnimationFrame(animate);
 })();
 </script>
 </body>
