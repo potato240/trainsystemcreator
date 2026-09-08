@@ -101,6 +101,41 @@
     max-width: 90vw;
     text-align: center;
   }
+  #livery {
+    position: fixed;
+    top: 14px;
+    left: 14px;
+    background: var(--panel);
+    border: 2px solid var(--panel-border);
+    border-radius: 12px;
+    padding: 8px 12px;
+    z-index: 10;
+    color: var(--ink);
+    font-size: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  #livery .title {
+    color: var(--amber);
+    font-weight: 700;
+    font-size: 12px;
+    letter-spacing: 0.03em;
+  }
+  #livery label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  #livery input[type="color"] {
+    width: 26px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    background: none;
+    cursor: pointer;
+  }
   #stats {
     position: fixed;
     top: 14px;
@@ -118,6 +153,13 @@
 </head>
 <body>
   <canvas id="canvas"></canvas>
+
+  <div id="livery">
+    <span class="title">Train Livery</span>
+    <label>Roof <input type="color" id="roofColor" value="#d7dbda"></label>
+    <label>Side <input type="color" id="sideColor" value="#1d4f91"></label>
+    <label>Cab <input type="color" id="cabColor" value="#e8c93d"></label>
+  </div>
 
   <div id="toolbar">
     <span class="brand">🚆 Track Editor</span>
@@ -189,6 +231,7 @@
   let selected = null; // {type:'node'|'track'|'facility', id}
   let dragging = null;
   let mouse = { x: 0, y: 0 };
+  let livery = { roof: '#d7dbda', side: '#1d4f91', cab: '#e8c93d' };
 
   function uid() { return nextId++; }
   function getNode(id) { return nodes.find(n => n.id === id); }
@@ -196,7 +239,7 @@
   function getFacility(id) { return facilities.find(f => f.id === id); }
 
   function save() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, tracks, facilities, trains, nextId }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, tracks, facilities, trains, nextId, livery }));
   }
   function load() {
     try {
@@ -208,6 +251,7 @@
         tracks = data.tracks;
         facilities = data.facilities || [];
         trains = data.trains || [];
+        if (data.livery) livery = { ...livery, ...data.livery };
         nextId = data.nextId || (Math.max(0,
           ...nodes.map(n => n.id), ...tracks.map(t => t.id),
           ...facilities.map(f => f.id), ...trains.map(t => t.id)) + 1);
@@ -764,14 +808,14 @@
     // roof, assumes already translated/rotated to the car's own center
     ctx.beginPath();
     ctx.roundRect(-CAR_LENGTH / 2, -TRAIN_WIDTH / 2, CAR_LENGTH, TRAIN_WIDTH, 6);
-    ctx.fillStyle = '#d7dbda';
+    ctx.fillStyle = livery.roof;
     ctx.fill();
     ctx.strokeStyle = '#23262a';
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    // Southeastern livery edge stripes
-    ctx.strokeStyle = '#1d4f91';
+    // livery edge stripes
+    ctx.strokeStyle = livery.side;
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(-CAR_LENGTH / 2 + 3, -TRAIN_WIDTH / 2 + 2);
@@ -802,9 +846,9 @@
       ctx.stroke();
     }
 
-    // yellow warning panel, only on the train's true leading/trailing ends
+    // cab-end warning panel, only on the train's true leading/trailing ends
     if (isFirstCar || isLastCar) {
-      ctx.fillStyle = '#e8c93d';
+      ctx.fillStyle = livery.cab;
       const ex = isFirstCar ? -CAR_LENGTH / 2 : CAR_LENGTH / 2 - 5;
       ctx.fillRect(ex, -TRAIN_WIDTH / 2 + 2, 5, TRAIN_WIDTH - 4);
     }
@@ -977,6 +1021,18 @@
     doubleToggleBtn.textContent = 'Double Track: ' + (doubleTrack ? 'On' : 'Off');
     doubleToggleBtn.classList.toggle('active', doubleTrack);
   });
+
+  const roofColorInput = document.getElementById('roofColor');
+  const sideColorInput = document.getElementById('sideColor');
+  const cabColorInput = document.getElementById('cabColor');
+  function syncLiveryInputs() {
+    roofColorInput.value = livery.roof;
+    sideColorInput.value = livery.side;
+    cabColorInput.value = livery.cab;
+  }
+  roofColorInput.addEventListener('input', () => { livery.roof = roofColorInput.value; save(); draw(); });
+  sideColorInput.addEventListener('input', () => { livery.side = sideColorInput.value; save(); draw(); });
+  cabColorInput.addEventListener('input', () => { livery.cab = cabColorInput.value; save(); draw(); });
 
   document.getElementById('spawnBtn').addEventListener('click', () => {
     if (!pendingRoute || pendingRoute.path.length < 2) {
@@ -1232,6 +1288,7 @@
   }
 
   load();
+  syncLiveryInputs();
   recomputeAutoTangents();
   resize();
   setMode('node');
