@@ -176,7 +176,7 @@
     <button class="tool danger" id="clearBtn">Clear All</button>
   </div>
 
-  <div id="stats">Nodes: <span id="nodeCount">0</span><br>Tracks: <span id="trackCount">0</span><br>Facilities: <span id="facilityCount">0</span><br>Trains: <span id="trainCount">0</span><br>Passengers: <span id="passengerCount">0</span><br>Roads: <span id="roadCount">0</span></div>
+  <div id="stats">Nodes: <span id="nodeCount">0</span><br>Tracks: <span id="trackCount">0</span><br>Facilities: <span id="facilityCount">0</span><br>Trains: <span id="trainCount">0</span><br>Passengers: <span id="passengerCount">0</span><br>Roads: <span id="roadCount">0</span><br>Cars: <span id="carCount">0</span></div>
 
   <div id="hint">Click empty ground to place a rail node.</div>
 
@@ -191,6 +191,7 @@
   const trainCountEl = document.getElementById('trainCount');
   const passengerCountEl = document.getElementById('passengerCount');
   const roadCountEl = document.getElementById('roadCount');
+  const carCountEl = document.getElementById('carCount');
   const STORAGE_KEY = 'tsc_track_state_v2';
 
   // Reference rolling stock: a 4-car Southeastern Class 375 "Electrostar" EMU.
@@ -217,6 +218,11 @@
   const GRID_SIZE = 40; // roads snap to this grid and may only run in the 8 grid directions
   const CROSSING_SNAP_DIST = GRID_SIZE / 2; // roads this close to a rail node snap onto it exactly
   const CROSSING_TRIGGER_DIST = 180; // px - a train this close to a crossing lowers its barriers
+  const CAR_SPEED = 55; // px/s
+  const CAR_SPAWN_SECONDS = 3;
+  const MAX_CARS = 10;
+  const CAR_STOP_T = 0.88; // how far along its final segment a car halts before a closed crossing
+  const CAR_COLORS = ['#c0392b', '#2c6f96', '#4a7c3f', '#c78be8', '#e8a33d', '#7d8180'];
 
   function resize() {
     canvas.width = window.innerWidth * devicePixelRatio;
@@ -237,6 +243,8 @@
   let passengerSpawnTimer = 0;
   let roadNodes = [];   // {id, x, y} - always grid-snapped
   let roadSegments = []; // {id, aId, bId} - straight, one of the 8 grid directions
+  let cars = [];        // {id, fromId, toId, t, x, y, angle, speed, color, state}
+  let carSpawnTimer = 0;
   let nextId = 1;
 
   let mode = 'node';
@@ -792,6 +800,29 @@
     ctx.fill();
   }
 
+  function drawCarVehicle(car) {
+    ctx.save();
+    ctx.translate(car.x, car.y);
+    ctx.rotate(car.angle);
+
+    ctx.beginPath();
+    ctx.roundRect(-7, -4, 14, 8, 2.5);
+    ctx.fillStyle = car.color;
+    ctx.fill();
+    ctx.strokeStyle = '#20201e';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // windshield toward the front, headlight tips
+    ctx.fillStyle = 'rgba(200,225,235,0.85)';
+    ctx.fillRect(1.5, -3, 3, 6);
+    ctx.fillStyle = '#fff2c9';
+    ctx.fillRect(6, -3, 1.5, 2);
+    ctx.fillRect(6, 1, 1.5, 2);
+
+    ctx.restore();
+  }
+
   // A level crossing's default angle runs perpendicular to whichever way the
   // track passes through its rail node - a reasonable starting guess for
   // where the road crosses it when there's no road there yet. Once a road is
@@ -1260,6 +1291,9 @@
     for (const n of roadNodes) {
       drawRoadNode(n, selected && selected.type === 'roadNode' && selected.id === n.id);
     }
+    for (const c of cars) {
+      drawCarVehicle(c);
+    }
     for (const t of tracks) {
       drawTrack(t, selected && selected.type === 'track' && selected.id === t.id);
     }
@@ -1313,6 +1347,7 @@
     trainCountEl.textContent = trains.length;
     passengerCountEl.textContent = passengers.length;
     roadCountEl.textContent = roadSegments.length;
+    carCountEl.textContent = cars.length;
   }
 
   // ---- interaction ----
@@ -1382,7 +1417,7 @@
     if (nodes.length === 0 && tracks.length === 0 && facilities.length === 0 && trains.length === 0
       && roadNodes.length === 0 && roadSegments.length === 0) return;
     if (confirm('Clear the entire track layout?')) {
-      nodes = []; tracks = []; facilities = []; trains = []; roadNodes = []; roadSegments = [];
+      nodes = []; tracks = []; facilities = []; trains = []; roadNodes = []; roadSegments = []; cars = [];
       selected = null; pendingConnectNode = null; pendingRoute = null; lastRoadNodeId = null;
       save(); draw();
     }
@@ -1626,6 +1661,76 @@
   // ---- train animation loop ----
   let lastTick = null;
   let simClock = 0; // seconds, drives the crossing lights' flash
+  // A rail node flagged .crossing sitting exactly at this road node's
+  // position (roads snap onto crossings exactly, so this is a plain equality
+  // check), or null if this road point isn't a crossing.
+  function crossingAtRoadNode(roadNodeId) {
+    const rn = getRoadNode(roadNodeId);
+    if (!rn) return null;
+    return nodes.find(n => n.crossing && n.x === rn.x && n.y === rn.y) || null;
+  }
+
+  function carNeighbors(nodeId, excludeId) {
+    const all = roadSegments.filter(s => s.aId === nodeId || s.bId === nodeId)
+      .map(s => s.aId === nodeId ? s.bId : s.aId);
+    const filtered = excludeId == null ? all : all.filter(id => id !== excludeId);
+    return filtered.length ? filtered : all; // double back at a dead end rather than getting stuck
+  }
+
+  function spawnCar() {
+    if (roadNodes.length < 2 || cars.length >= MAX_CARS) return;
+    const start = roadNodes[Math.floor(Math.random() * roadNodes.length)];
+    const options = carNeighbors(start.id, null);
+    if (options.length === 0) return;
+    const toId = options[Math.floor(Math.random() * options.length)];
+    cars.push({
+      id: uid(), fromId: start.id, toId, t: 0, x: start.x, y: start.y, angle: 0,
+      speed: CAR_SPEED, color: CAR_COLORS[Math.floor(Math.random() * CAR_COLORS.length)],
+      state: 'driving',
+    });
+  }
+
+  // Cars wander the road graph, picking a random onward road at each
+  // junction (avoiding an immediate U-turn where another option exists), and
+  // halt just short of a road point that's a level crossing with its
+  // barriers down, resuming once they ease back open.
+  function tickCar(car, dt) {
+    if (car.state === 'waiting') {
+      const crossing = crossingAtRoadNode(car.toId);
+      if (!crossing || (crossing.barrier || 0) < 0.3) car.state = 'driving';
+      return;
+    }
+
+    const a = getRoadNode(car.fromId), b = getRoadNode(car.toId);
+    if (!a || !b) { car.state = 'dead'; return; }
+
+    const segLen = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+    const nextT = car.t + (car.speed * dt) / segLen;
+    const crossing = crossingAtRoadNode(car.toId);
+
+    if (crossing && (crossing.barrier || 0) > 0.3 && nextT >= CAR_STOP_T && car.t < CAR_STOP_T) {
+      car.t = CAR_STOP_T;
+      car.state = 'waiting';
+    } else if (nextT >= 1) {
+      const arrivedFrom = car.fromId;
+      car.fromId = car.toId;
+      car.t = 0;
+      const options = carNeighbors(car.fromId, arrivedFrom);
+      car.toId = options[Math.floor(Math.random() * options.length)];
+    } else {
+      car.t = nextT;
+    }
+
+    const na = getRoadNode(car.fromId), nb = getRoadNode(car.toId);
+    if (na && nb) {
+      car.x = na.x + (nb.x - na.x) * car.t;
+      car.y = na.y + (nb.y - na.y) * car.t;
+      car.angle = Math.atan2(nb.y - na.y, nb.x - na.x);
+    } else {
+      car.state = 'dead';
+    }
+  }
+
   function stationList() { return facilities.filter(f => f.kind === 'station'); }
 
   function passengerSpawnPos(f) {
@@ -1788,7 +1893,15 @@
       for (const p of passengers) tickPassenger(p, dt);
       passengers = passengers.filter(p => p.state !== 'arrived');
 
-      if (trains.length > 0 || passengers.length > 0) draw();
+      carSpawnTimer += dt;
+      if (carSpawnTimer >= CAR_SPAWN_SECONDS) {
+        carSpawnTimer = 0;
+        spawnCar();
+      }
+      for (const c of cars) tickCar(c, dt);
+      cars = cars.filter(c => c.state !== 'dead');
+
+      if (trains.length > 0 || passengers.length > 0 || cars.length > 0) draw();
     }
     lastTick = ts;
     requestAnimationFrame(animate);
