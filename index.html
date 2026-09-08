@@ -766,22 +766,43 @@
     ctx.fill();
   }
 
-  // A level crossing is a rail node flagged .crossing - render red/white
-  // hazard stripes across the track there, perpendicular to whichever way
-  // the track runs through it, plus short barrier arms on each side.
-  function drawCrossing(node) {
+  // A level crossing's default angle runs perpendicular to whichever way the
+  // track passes through its rail node - a reasonable starting guess for
+  // where the road crosses it, since crossingAngle is user-adjustable after.
+  function defaultCrossingAngle(node) {
     const neigh = nodeNeighbors(node.id);
     let angle = 0;
     if (neigh.length > 0) {
       const other = getNode(neigh[0].otherId);
       angle = Math.atan2(other.y - node.y, other.x - node.x);
     }
-    const perp = angle + Math.PI / 2;
-    const barLen = 26;
+    return angle + Math.PI / 2;
+  }
+
+  const CROSSING_BAR_LEN = 26;
+
+  function crossingHandlePos(node) {
+    const r = CROSSING_BAR_LEN + 20;
+    return { x: node.x + Math.cos(node.crossingAngle) * r, y: node.y + Math.sin(node.crossingAngle) * r };
+  }
+
+  function hitCrossingHandle(x, y) {
+    if (!selected || selected.type !== 'node') return null;
+    const n = getNode(selected.id);
+    if (!n || !n.crossing) return null;
+    const h = crossingHandlePos(n);
+    return Math.hypot(h.x - x, h.y - y) <= 8 ? n.id : null;
+  }
+
+  // A level crossing is a rail node flagged .crossing - render red/white
+  // hazard stripes across the track there at its own adjustable angle, plus
+  // short barrier arms on each side.
+  function drawCrossing(node, isSelected) {
+    const barLen = CROSSING_BAR_LEN;
 
     ctx.save();
     ctx.translate(node.x, node.y);
-    ctx.rotate(perp);
+    ctx.rotate(node.crossingAngle);
 
     // road surface patch with diagonal hazard stripes
     ctx.save();
@@ -812,6 +833,23 @@
       ctx.restore();
     }
     ctx.restore();
+
+    if (isSelected) {
+      const h = crossingHandlePos(node);
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(node.x, node.y);
+      ctx.lineTo(h.x, h.y);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(h.x, h.y, 7, 0, Math.PI * 2);
+      ctx.fillStyle = '#5cb3e8';
+      ctx.fill();
+      ctx.strokeStyle = '#1c4e6b';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
   }
 
   function drawTrackLane(pts, isSelected) {
@@ -1174,7 +1212,7 @@
       const isSelected = selected && selected.type === 'node' && selected.id === n.id;
       const isPending = pendingConnectNode === n.id;
       drawNode(n, isSelected, isPending);
-      if (n.crossing) drawCrossing(n);
+      if (n.crossing) drawCrossing(n, isSelected);
     }
     for (const tr of trains) {
       drawArticulatedTrain(makeRouteSampler(tr));
@@ -1242,7 +1280,7 @@
       : 'Click a depot\'s track node to start a route.';
     else if (mode === 'road') hint.textContent = 'Click to place a road point on the grid. Click another point in one of the 8 grid directions (N/S/E/W or diagonal) to pave a road between them - keeps chaining from the last point. Esc to break the chain.';
     else if (mode === 'crossing') hint.textContent = 'Click a rail node to toggle a level crossing there.';
-    else if (mode === 'select') hint.textContent = 'Drag nodes or facilities to move them. Click a track to bend it, or a facility to rotate it (drag blue handles). Press Delete to remove selection.';
+    else if (mode === 'select') hint.textContent = 'Drag nodes or facilities to move them. Click a track, facility, or crossing to bend/rotate it (drag blue handles). Press Delete to remove selection.';
   }
 
   document.querySelectorAll('button.tool[data-mode]').forEach(b => {
@@ -1367,6 +1405,7 @@
       const n = hitNode(p.x, p.y);
       if (!n) { hint.textContent = 'Click an existing rail node to toggle a level crossing.'; return; }
       n.crossing = !n.crossing;
+      if (n.crossing && n.crossingAngle == null) n.crossingAngle = defaultCrossingAngle(n);
       save();
       draw();
       return;
@@ -1378,6 +1417,9 @@
 
       const fh = hitFacilityHandle(p.x, p.y);
       if (fh) { dragging = { type: 'facilityHandle', id: fh }; return; }
+
+      const ch = hitCrossingHandle(p.x, p.y);
+      if (ch) { dragging = { type: 'crossingHandle', id: ch }; return; }
 
       const n = hitNode(p.x, p.y);
       if (n) {
@@ -1448,6 +1490,9 @@
     } else if (dragging.type === 'facilityHandle') {
       const f = getFacility(dragging.id);
       if (f) { f.angle = Math.atan2(mouse.y - f.y, mouse.x - f.x); draw(); }
+    } else if (dragging.type === 'crossingHandle') {
+      const n = getNode(dragging.id);
+      if (n) { n.crossingAngle = Math.atan2(mouse.y - n.y, mouse.x - n.x); draw(); }
     } else if (dragging.type === 'newFacility') {
       const dx = mouse.x - dragging.startX, dy = mouse.y - dragging.startY;
       const dist = Math.hypot(dx, dy);
